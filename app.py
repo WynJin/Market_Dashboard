@@ -21,6 +21,7 @@ import streamlit as st
 
 import data_fetcher as dfetch
 import indicators as ind
+from data_source.factory import get_lookback_defaults
 
 # ---------------------------------------------------------------------------
 # 页面基础配置
@@ -39,17 +40,121 @@ INDEX_MAP = {
 
 C_BLUE, C_RED, C_GRAY, C_GREEN, C_ORANGE = "#1f5fbf", "#d6332a", "#9aa5b1", "#1a9e5d", "#e08a1e"
 
+# 可叠加的常用指数（名称 -> 新浪代码）
+COMMON_INDICES = ["上证指数", "深证成指", "沪深300", "上证50", "中证500",
+                  "中证1000", "创业板指", "科创50"]
+_COMMON_INDEX_CODES = {
+    "上证指数": "sh000001", "深证成指": "sz399001", "沪深300": "sh000300",
+    "上证50": "sh000016", "中证500": "sh000905", "中证1000": "sh000852",
+    "创业板指": "sz399006", "科创50": "sh000688",
+}
+_INDEX_COLORS = [C_BLUE, C_RED, C_GREEN, C_ORANGE, "#7a3e9d", "#0f8b8d", "#b5651d", C_GRAY]
+
+
+@st.cache_data(ttl=12 * 3600)
+def _load_index_close(name: str) -> pd.DataFrame:
+    """加载单个指数的日线收盘价，结果缓存 12 小时。"""
+    df = dfetch.get_index_daily(_COMMON_INDEX_CODES[name])
+    return df[["date", "close"]].rename(columns={"close": name})
+
+
+def add_index_overlay(fig, selected, date_min, date_max):
+    """复用：把选中的常用指数叠加到 fig 的右轴(y2)。
+
+    - selected: 指数名称列表（为空则原样返回）
+    - date_min/date_max: 叠加的日期范围，与主图 x 轴对齐
+    - 自动创建/复用 yaxis2，标题为「指数点位」
+    """
+    if not selected:
+        return fig
+    for i, name in enumerate(selected):
+        idx = _load_index_close(name)
+        idx = idx[(idx["date"] >= date_min) & (idx["date"] <= date_max)]
+        if idx.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=idx["date"], y=idx[name], name=f"{name}（点位·右轴）",
+            line=dict(width=1.4, color=_INDEX_COLORS[i % len(_INDEX_COLORS)]),
+            opacity=0.72, yaxis="y2",
+        ))
+    fig.update_layout(
+        yaxis2=dict(title="指数点位", overlaying="y", side="right", showgrid=False),
+    )
+    return fig
+
+
+def _fetch_with_progress(cache_key: str, label: str, fetch_fn, *args, **kwargs):
+    """复用的逐日回溯加载器：全局缓存（跨用户共享）+ Streamlit 进度条。
+
+    - 命中全局缓存 → 静默返回，不显示进度条
+    - 未命中 → 显示进度条，回调实时更新
+    fetch_fn 必须支持 _progress_callback(current, total) 关键字参数。
+    """
+    if dfetch.is_cached(cache_key):
+        return fetch_fn(*args, **kwargs)
+    prog = st.progress(0.0, text=label)
+
+    def _cb(cur, total):
+        prog.progress(cur / total, text=f"拉取进度 {cur}/{total} 个自然日…")
+
+    kwargs["_progress_callback"] = _cb
+    result = fetch_fn(*args, **kwargs)
+    prog.empty()
+    return result
+
+
+def show_data_sources(items: list[tuple[str, str]]) -> None:
+    """在可折叠面板中展示本页用到的数据源说明。
+
+    items: [(数据项名称, data_fetcher 方法名), ...]
+    每条显示：一级源（akshare/tushare）+ 二级渠道（原始发布渠道 + 频率）。
+    """
+    lines = []
+    for label, method in items:
+        l1, l2 = dfetch.get_source_info(method)
+        lines.append(f"- **{label}** — 一级 `{l1}` ｜ 二级：{l2}")
+    with st.expander("📡 本页数据源说明（一级库 / 二级渠道·频率）", expanded=False):
+        st.markdown("\n".join(lines))
+        st.caption("一级 = 实际命中的数据获取库（失败自动降级时会切换）；二级 = 原始数据发布渠道与频率。")
+
+
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    """将十六进制颜色转换为 Plotly 可用的 rgba(...) 字符串。"""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r}, {g}, {b}, {alpha})"
+
+
 with st.sidebar:
     st.header("⚙️ 参数设置")
+    # 数据源选择：多源架构，akshare 始终可用，tushare 需配置 TUSHARE_TOKEN
+    avail_sources = dfetch.available_sources()
+    if "data_source" not in st.session_state:
+        st.session_state["data_source"] = avail_sources[0] if avail_sources else "akshare"
+    cur_src = st.selectbox(
+        "数据源（失败自动降级）", avail_sources,
+        index=avail_sources.index(st.session_state["data_source"])
+        if st.session_state["data_source"] in avail_sources else 0,
+        help="tushare 需在环境变量 TUSHARE_TOKEN 中配置；部分接口有积分门槛，不足时自动降级到 akshare")
+    if cur_src != st.session_state["data_source"]:
+        st.session_state["data_source"] = cur_src
+        dfetch.set_data_source(cur_src)
+        st.cache_data.clear()
+        st.toast(f"已切换数据源为 {cur_src}，缓存已清空")
     pe_name = st.selectbox("息差定价基准（指数）", list(INDEX_MAP.keys()), index=0)
     band_days = st.slider("轨道滚动窗口（天）", 365, 2920, 1095, step=30,
-                          help="PE 为月频数据，内部按 30.44 天/月换算为滚动月数")
+                          help="PE 为月频数据，内部按 30.44 天/月换算为滚动月数；建议 3~5 年（1095~1825 天），窗口过短会导致轨道剧烈波动失效")
     sigma_k = st.slider("高亮轨道倍数 σ", 1.0, 2.5, 2.0, step=0.5)
-    lookback_days = st.slider("PCR / 期指回溯自然日数", 20, 90, 45,
-                              help="交易所历史接口按天回溯，越大越慢（已缓存）")
+    _lb = get_lookback_defaults()
+    pcr_lookback = st.slider("PCR 回溯自然日数", 10, 180, _lb["pcr"],
+                             help="期权 PCR 逐日回溯；数据量小，默认约 1 个月")
+    futures_lookback = st.slider("期指 / 中信持仓回溯自然日数", 30, 365, _lb["futures"],
+                                 help="股指期货基差与中信期货持仓逐日回溯；默认约 4 个月，越大覆盖已到期合约越多")
     cot_years = st.slider("COT 持仓回溯年数", 1, 5, 3)
     if st.button("🔄 强制刷新全部数据", width="stretch"):
         st.cache_data.clear()
+        # 清除 PCR / 期权券商持仓 / 中信持仓的全局缓存
+        dfetch.clear_global_cache()
         st.toast("缓存已清空，重新拉取数据")
     st.caption("数据默认缓存 12~24 小时；首次加载 PCR/期指历史需逐日回溯，请耐心等待。")
 
@@ -72,9 +177,16 @@ with tab_core:
             pe_m = dfetch.get_index_pe_monthly(legu_name)
             index_daily = dfetch.get_index_daily(sina_code)
 
+        show_data_sources([
+            ("10 年期国债收益率", "get_bond_10y"),
+            ("指数市盈率（月频）", "get_index_pe_monthly"),
+            ("大盘指数行情", "get_index_daily"),
+            ("指数市盈率（日频）", "get_index_pe_daily_csindex"),
+        ])
+
         erp_df = ind.build_erp(pe_m, bond)
         idx_recent = index_daily[index_daily["date"] >= erp_df["date"].min()]
-        window = max(1, round(band_days / 30.44))  # 月频样本，按30.44天/月换算
+        window = max(12, round(band_days / 30.44))  # 月频样本，按30.44天/月换算；至少12个月
         erp_df = ind.add_std_bands(erp_df, "erp", window=window, n_sigma=sigma_k)
         erp_df["pct_rank"] = ind.rolling_percentile(erp_df["erp"], window=max(window, 60))
         last = erp_df.iloc[-1]
@@ -107,6 +219,7 @@ with tab_core:
         else:
             erp_show, idx_show = erp_df, idx_recent
         st.caption(f"当前显示 {len(erp_show)} 个月数据 · 轨道基于全量历史滚动计算，仅显示范围被裁剪")
+        ol_erp = st.multiselect("叠加指数走势（右轴）", COMMON_INDICES, key="overlay_erp")
 
         fig = go.Figure()
         # ±2σ / ±1σ 浅色背景轨
@@ -159,6 +272,7 @@ with tab_core:
                         showgrid=False),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         )
+        add_index_overlay(fig, ol_erp, erp_show["date"].min(), erp_show["date"].max())
         st.plotly_chart(fig, width="stretch")
 
         # 近期日频 PE（中证官网，近约 20 个交易日，补充月频精度）
@@ -185,6 +299,7 @@ with tab_shibor:
     try:
         with st.spinner("拉取 SHIBOR…"):
             shibor = dfetch.get_shibor()
+        show_data_sources([("SHIBOR 期限结构", "get_shibor")])
         latest_date = shibor["date"].max()
         latest = shibor[shibor["date"] == latest_date].iloc[0]
         tenors = [c for c in shibor.columns if c != "date"]
@@ -204,6 +319,7 @@ with tab_shibor:
 
         st.subheader("历史走势")
         picked = st.multiselect("选择期限", tenors, default=["1周", "1个月", "3个月", "1年"])
+        ol_shibor = st.multiselect("叠加指数走势（右轴）", COMMON_INDICES, key="overlay_shibor")
         if picked:
             fig_h = go.Figure()
             palette = [C_BLUE, C_RED, C_GREEN, C_ORANGE, "#7a3e9d", C_GRAY, "#0f8b8d", "#b5651d"]
@@ -226,6 +342,7 @@ with tab_shibor:
                     ),
                 ),
             )
+            add_index_overlay(fig_h, ol_shibor, shibor["date"].min(), shibor["date"].max())
             st.plotly_chart(fig_h, width="stretch")
         st.caption("数据源：shibor.org（全国银行间同业拆借中心）。短端利率飙升=资金面紧张，"
                    "视频中用于观察大资金流动性。")
@@ -237,49 +354,354 @@ with tab_shibor:
 # ---------------------------------------------------------------------------
 with tab_pcr:
     try:
-        with st.spinner(f"逐日回溯抓取近 {lookback_days} 个自然日期权统计（交易所接口，首次较慢）…"):
-            pcr = dfetch.get_option_pcr_history(lookback_days)
-        if pcr.empty:
+        # ---- 全市场 PCR（按标的 + 到期月聚合）----
+        pcr_cache_key = f"pcr_{pcr_lookback}"
+        pcr = _fetch_with_progress(
+            pcr_cache_key,
+            "正在逐日回溯拉取全市场期权数据（首次较慢，请稍候）…",
+            dfetch.get_option_pcr_history, pcr_lookback)
+
+        # 机构筛选开关：默认关闭（全市场），开启后才懒加载券商持仓数据
+        enable_broker = st.checkbox(
+            "🏛️ 按机构筛选（默认关闭=全市场）", value=False,
+            help="开启后可选择具体机构（如中信），仅计算该机构的期权持仓 PCR。"
+                 "上交所仅公开前 3 大标的认购/认沽前 5 名会员持仓量。")
+
+        broker_df = pd.DataFrame()
+        sel_brokers: list[str] = []
+        if enable_broker:
+            broker_cache_key = f"opt_broker_{pcr_lookback}"
+            broker_df = _fetch_with_progress(
+                broker_cache_key,
+                "正在逐日回溯拉取期权券商持仓排名…",
+                dfetch.get_option_broker_holding_history, pcr_lookback)
+            all_brokers = sorted(broker_df["broker"].unique()) if not broker_df.empty else []
+            sel_brokers = st.multiselect(
+                "选择机构（可多选，留空=全市场）", all_brokers, default=[],
+                help="留空=全市场模式；选中后仅计算所选机构持仓 PCR。",
+                key="pcr_sel_brokers")
+
+        broker_mode = enable_broker and bool(sel_brokers)
+
+        # 数据源展示（仅展示实际用到的源）
+        src_items = [("全市场期权 PCR（分标的+到期月）", "get_option_pcr_history")]
+        if enable_broker:
+            src_items.append(("期权券商持仓排名", "get_option_broker_holding_history"))
+        show_data_sources(src_items)
+
+        if pcr.empty and (not enable_broker or broker_df.empty):
             st.warning("未获取到期权数据（可能是非交易时段或交易所接口暂不可用）。")
         else:
-            latest_d = pcr["date"].max()
-            today_df = pcr[pcr["date"] == latest_d].copy()
-            # 全市场合成 PCR
-            agg = pcr.groupby("date", as_index=False).agg(
-                call_volume=("call_volume", "sum"), put_volume=("put_volume", "sum"),
-                call_oi=("call_oi", "sum"), put_oi=("put_oi", "sum"))
-            agg["pcr_volume"] = agg["put_volume"] / agg["call_volume"]
-            agg["pcr_oi"] = agg["put_oi"] / agg["call_oi"]
-            a = agg.iloc[-1]
-            st.subheader(f"全市场 ETF 期权 PCR（{latest_d.strftime('%Y-%m-%d')}）")
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("成交量 PCR", f"{a['pcr_volume']:.3f}")
-            k2.metric("持仓量 PCR", f"{a['pcr_oi']:.3f}")
-            k3.metric("当日认购成交", f"{a['call_volume']/1e4:.0f} 万张")
-            k4.metric("当日认沽成交", f"{a['put_volume']/1e4:.0f} 万张")
-            st.caption("成交量 PCR 反映当日对冲/投机情绪；持仓量 PCR 反映中期防御仓位。"
-                       + ind.pcr_signal(a["pcr_volume"]))
+            # ===== 到期月份多选（仅全市场模式可用）=====
+            # 到期月份多选：仅全市场模式可用（券商持仓数据按标的聚合，无到期月细分）
+            all_months = sorted(pcr["exp_month"].unique()) if not pcr.empty else []
+            cur_ym = pd.Timestamp.now().strftime("%y%m")
+            ongoing_months = [m for m in all_months if m != "全部" and m >= cur_ym]
+            default_months = ongoing_months[:3] if ongoing_months else all_months[:3]
+            month_labels = {
+                m: (f"20{m[:2]}-{m[2:]}" if m != "全部" else "全部月份")
+                for m in all_months
+            }
+            sel_months = st.multiselect(
+                "📅 到期月份（可多选）", all_months, default=default_months,
+                format_func=lambda m: month_labels.get(m, m),
+                disabled=broker_mode,
+                help="仅全市场模式（未选机构）可用。券商持仓数据按标的聚合，"
+                     "无到期月份细分。" if broker_mode else "默认最近 3 个存续月份",
+                key="pcr_sel_months")
 
-            show_df = today_df[["underlying", "call_volume", "put_volume", "pcr_volume",
-                                "call_oi", "put_oi", "pcr_oi"]].copy()
-            for c in ["pcr_volume", "pcr_oi"]:
-                show_df[c] = show_df[c].round(3)
-            st.dataframe(show_df.rename(columns={
-                "underlying": "标的", "call_volume": "认购成交量", "put_volume": "认沽成交量",
-                "pcr_volume": "成交量PCR", "call_oi": "认购持仓", "put_oi": "认沽持仓",
-                "pcr_oi": "持仓量PCR"}), width="stretch", hide_index=True)
+            # ===== 标准差上下轨参数（单一指标时启用）=====
+            with st.expander("📐 标准差上下轨（单一 PCR 指标时显示）", expanded=False):
+                bw_c, bs_c = st.columns(2)
+                with bw_c:
+                    band_window = st.slider(
+                        "滚动窗口（交易日）", 20, 180, 60, step=5,
+                        help="计算均值与标准差的滚动窗口；窗口越长轨道越平滑，"
+                             "过短会因样本不足而失效",
+                        key="pcr_band_window")
+                with bs_c:
+                    band_sigma = st.slider(
+                        "轨道倍数 σ", 1.0, 3.0, 2.0, step=0.1,
+                        help="填充区间 = 均值 ± nσ；同时以虚线显示 ±1σ 与 ±2σ",
+                        key="pcr_band_sigma")
 
-            fig_p = go.Figure()
-            fig_p.add_trace(go.Scatter(x=agg["date"], y=agg["pcr_volume"],
-                                       name="成交量 PCR", line=dict(color=C_BLUE, width=2.4)))
-            fig_p.add_trace(go.Scatter(x=agg["date"], y=agg["pcr_oi"],
-                                       name="持仓量 PCR", line=dict(color=C_ORANGE, width=2)))
-            fig_p.add_hline(y=1.0, line_dash="dash", line_color=C_GRAY)
-            fig_p.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10),
-                                yaxis_title="Put / Call", hovermode="x unified",
-                                legend=dict(orientation="h", y=1.08))
-            st.plotly_chart(fig_p, width="stretch")
-            st.caption("数据源：上交所 / 深交所官方股票期权日统计（50ETF、300ETF、500ETF、创业板、科创50 等）。")
+            # ===== 数据分支：机构模式 vs 全市场模式 =====
+            if broker_mode:
+                # ---- 机构模式：用券商持仓数据，仅 OI-PCR ----
+                if broker_df.empty:
+                    st.warning("未获取到券商持仓数据。")
+                else:
+                    bdf = broker_df[broker_df["broker"].isin(sel_brokers)].copy()
+                    if bdf.empty:
+                        st.warning("所选机构在持仓排名中无数据。")
+                    else:
+                        latest_d = bdf["date"].max()
+                        all_underlyings = sorted(bdf["underlying"].unique())
+
+                        # 筛选区 2：标的多选
+                        sel_underlyings = st.multiselect(
+                            "📊 选择标的（可多选）", all_underlyings,
+                            default=all_underlyings, key="pcr_broker_underlyings")
+
+                        if not sel_underlyings:
+                            st.warning("请至少选择一个标的。")
+                        else:
+                            df = bdf[bdf["underlying"].isin(sel_underlyings)].copy()
+                            # 按 (date, underlying) 聚合所选机构的 call/put OI
+                            agg = df.groupby(["date", "underlying"], as_index=False).agg(
+                                call_oi=("call_oi", "sum"), put_oi=("put_oi", "sum"))
+                            agg["pcr_oi"] = agg["put_oi"] / agg["call_oi"].replace(0, pd.NA)
+
+                            today_df = agg[agg["date"] == latest_d].copy()
+                            total_call_o = today_df["call_oi"].sum()
+                            total_put_o = today_df["put_oi"].sum()
+                            agg_pcr_o = total_put_o / total_call_o if total_call_o else None
+
+                            broker_names = "、".join(sel_brokers)
+                            st.subheader(f"期权 PCR 概览（{latest_d.strftime('%Y-%m-%d')}，"
+                                         f"机构：{broker_names}）")
+                            k1, k2, k3 = st.columns(3)
+                            k1.metric("合计 持仓量 PCR",
+                                      f"{agg_pcr_o:.3f}" if agg_pcr_o else "—")
+                            k2.metric("认购持仓（所选机构）", f"{total_call_o/1e4:.0f} 万张")
+                            k3.metric("认沽持仓（所选机构）", f"{total_put_o/1e4:.0f} 万张")
+                            if agg_pcr_o is not None:
+                                st.caption("持仓量 PCR = 所选机构认沽持仓 / 认购持仓，"
+                                           "反映机构中期多空倾向。" + ind.pcr_signal(agg_pcr_o))
+                            st.caption("⚠️ 数据来源：上交所期权持仓排名（前 3 大标的 × 认购/"
+                                       "认沽前 5 会员）。仅持仓量，无成交量；按标的聚合无到期月。")
+
+                            # 历史走势（仅 OI-PCR）
+                            st.markdown("##### 持仓量 PCR 历史走势")
+                            ol_pcr = st.multiselect("叠加指数走势（右轴）", COMMON_INDICES,
+                                                    key="overlay_pcr_broker")
+                            palette = ["#1f5fbf", "#d6332a", "#1a9e5d", "#e08a1e",
+                                       "#7a3e9d", "#0f8b8d", "#b5651d", "#9aa5b1"]
+                            fig_p = go.Figure()
+                            # 有效窗口 = 用户窗口 与 最短标的数据长度 的较小值，避免轨道全 NaN
+                            min_pts = min(len(agg[agg["underlying"] == ul])
+                                          for ul in sel_underlyings) if sel_underlyings else 0
+                            eff_window = min(band_window, min_pts)
+                            for i, ul in enumerate(sel_underlyings):
+                                g = agg[agg["underlying"] == ul].sort_values("date").copy()
+                                color = palette[i % len(palette)]
+                                # 单一指标（持仓量 PCR），叠加标准差上下轨
+                                g = ind.add_std_bands(g, "pcr_oi", window=eff_window,
+                                                      n_sigma=band_sigma)
+                                fig_p.add_trace(go.Scatter(
+                                    x=g["date"], y=g["pcr_oi"],
+                                    name=f"{ul} · 持仓量",
+                                    line=dict(color=color, width=2.2, dash="solid")))
+                                fig_p.add_trace(go.Scatter(
+                                    x=g["date"], y=g["mean"],
+                                    name=f"{ul} · 均值",
+                                    line=dict(color=color, width=1.2, dash="dash"),
+                                    opacity=0.6, showlegend=False))
+                                # ±1σ 与 ±2σ 参考线
+                                for lb, ub, dash in [("lower1", "upper1", "dot"),
+                                                     ("lower2", "upper2", "longdash")]:
+                                    fig_p.add_trace(go.Scatter(
+                                        x=g["date"], y=g[ub], line=dict(
+                                            color=color, width=1, dash=dash),
+                                        opacity=0.35, showlegend=False,
+                                        hoverinfo="skip"))
+                                    fig_p.add_trace(go.Scatter(
+                                        x=g["date"], y=g[lb], line=dict(
+                                            color=color, width=1, dash=dash),
+                                        opacity=0.35, showlegend=False,
+                                        fill="tonexty",
+                                        fillcolor=_hex_to_rgba(color, 0.06)
+                                        if lb == "lower2" else None,
+                                        hoverinfo="skip"))
+                            fig_p.add_hline(y=1.0, line_dash="dash", line_color=C_GRAY,
+                                            annotation_text="PCR=1（多空均衡）",
+                                            annotation_position="top right")
+                            fig_p.update_layout(
+                                height=440, margin=dict(l=10, r=10, t=30, b=10),
+                                yaxis_title="Put / Call Ratio", hovermode="x unified",
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+                                xaxis=dict(
+                                    rangeslider=dict(visible=True, thickness=0.06),
+                                    rangeselector=dict(buttons=list([
+                                        dict(count=1, label="1月", step="month", stepmode="backward"),
+                                        dict(count=3, label="3月", step="month", stepmode="backward"),
+                                        dict(count=6, label="6月", step="month", stepmode="backward"),
+                                        dict(step="all", label="全部"),
+                                    ])),
+                                ),
+                            )
+                            add_index_overlay(fig_p, ol_pcr, agg["date"].min(), agg["date"].max())
+                            st.plotly_chart(fig_p, width="stretch")
+                            _cap = (f"机构模式仅含持仓量 PCR，已叠加 ±{band_sigma:.1f}σ 填充区间"
+                                    f"（有效窗口 {eff_window} 个交易日）；点线=±1σ，长虚线=±2σ。")
+                            if eff_window < band_window:
+                                _cap += f" 数据不足，窗口已从 {band_window} 自动缩减。"
+                            st.caption(_cap)
+
+                            # 最新日分标的明细
+                            with st.expander(f"� 最新日分标的明细（{latest_d.strftime('%Y-%m-%d')}）"):
+                                show_df = today_df[["underlying", "call_oi", "put_oi", "pcr_oi"]].copy()
+                                show_df["pcr_oi"] = show_df["pcr_oi"].round(3)
+                                st.dataframe(show_df.rename(columns={
+                                    "underlying": "标的", "call_oi": "认购持仓",
+                                    "put_oi": "认沽持仓", "pcr_oi": "持仓量PCR"}),
+                                    width="stretch", hide_index=True)
+
+                            # 所选机构分标的持仓明细
+                            with st.expander("🏛️ 所选机构分标的持仓明细"):
+                                detail = df[df["date"] == latest_d][
+                                    ["underlying", "broker", "call_oi", "put_oi", "pcr_oi"]].copy()
+                                detail["pcr_oi"] = detail["pcr_oi"].round(3)
+                                st.dataframe(detail.rename(columns={
+                                    "underlying": "标的", "broker": "机构",
+                                    "call_oi": "认购持仓", "put_oi": "认沽持仓",
+                                    "pcr_oi": "持仓量PCR"}), width="stretch", hide_index=True)
+
+            else:
+                # ---- 全市场模式：用全市场 PCR 数据，支持到期月份筛选 ----
+                if pcr.empty:
+                    st.warning("未获取到全市场期权数据。")
+                else:
+                    latest_d = pcr["date"].max()
+                    all_underlyings = sorted(pcr["underlying"].unique())
+
+                    # 按到期月份过滤
+                    month_df = pcr[pcr["exp_month"].isin(sel_months)].copy() if sel_months else pcr.copy()
+                    # 聚合到 (date, underlying) 级别（跨所选到期月求和）
+                    df = month_df.groupby(["date", "underlying"], as_index=False).agg(
+                        call_volume=("call_volume", "sum"),
+                        put_volume=("put_volume", "sum"),
+                        call_oi=("call_oi", "sum"), put_oi=("put_oi", "sum"))
+                    df["pcr_volume"] = df["put_volume"] / df["call_volume"].replace(0, pd.NA)
+                    df["pcr_oi"] = df["put_oi"] / df["call_oi"].replace(0, pd.NA)
+
+                    # 筛选区 2：标的多选 + 指标类型
+                    c1, c2 = st.columns([3, 2])
+                    with c1:
+                        sel_underlyings = st.multiselect(
+                            "📊 选择标的（可多选）", all_underlyings,
+                            default=all_underlyings, key="pcr_sel_underlyings")
+                    with c2:
+                        st.write("📈 PCR 指标类型")
+                        show_vol = st.checkbox("成交量 PCR", value=True, key="pcr_show_vol")
+                        show_oi = st.checkbox("持仓量 PCR", value=True, key="pcr_show_oi")
+
+                    if not sel_underlyings or not (show_vol or show_oi):
+                        st.warning("请至少选择一个标的和一种 PCR 指标。")
+                    else:
+                        df = df[df["underlying"].isin(sel_underlyings)].copy()
+                        today_df = df[df["date"] == latest_d].copy()
+                        total_call_v = today_df["call_volume"].sum()
+                        total_put_v = today_df["put_volume"].sum()
+                        total_call_o = today_df["call_oi"].sum()
+                        total_put_o = today_df["put_oi"].sum()
+                        agg_pcr_v = total_put_v / total_call_v if total_call_v else None
+                        agg_pcr_o = total_put_o / total_call_o if total_call_o else None
+
+                        month_note = f"，到期月：{', '.join(sel_months)}" if sel_months else ""
+                        st.subheader(f"全市场期权 PCR 概览（{latest_d.strftime('%Y-%m-%d')}，"
+                                     f"已选 {len(sel_underlyings)} 个标的{month_note}）")
+                        k1, k2, k3, k4 = st.columns(4)
+                        k1.metric("合计 成交量 PCR",
+                                  f"{agg_pcr_v:.3f}" if agg_pcr_v else "—")
+                        k2.metric("合计 持仓量 PCR",
+                                  f"{agg_pcr_o:.3f}" if agg_pcr_o else "—")
+                        k3.metric("当日认购成交", f"{total_call_v/1e4:.0f} 万张")
+                        k4.metric("当日认沽成交", f"{total_put_v/1e4:.0f} 万张")
+                        if agg_pcr_v is not None:
+                            st.caption("成交量 PCR 反映当日对冲/投机情绪；持仓量 PCR 反映中期防御仓位。"
+                                       + ind.pcr_signal(agg_pcr_v))
+
+                        st.markdown("##### PCR 历史走势")
+                        ol_pcr = st.multiselect("叠加指数走势（右轴）", COMMON_INDICES,
+                                                key="overlay_pcr")
+                        palette = ["#1f5fbf", "#d6332a", "#1a9e5d", "#e08a1e",
+                                   "#7a3e9d", "#0f8b8d", "#b5651d", "#9aa5b1"]
+                        fig_p = go.Figure()
+                        # 仅当只选一种 PCR 指标时叠加标准差上下轨
+                        single_ind = show_vol ^ show_oi
+                        active_col = "pcr_volume" if show_vol else "pcr_oi"
+                        # 有效窗口 = 用户窗口 与 最短标的数据长度 的较小值，避免轨道全 NaN
+                        min_pts = min(len(df[df["underlying"] == ul])
+                                      for ul in sel_underlyings) if sel_underlyings else 0
+                        eff_window = min(band_window, min_pts)
+                        for i, ul in enumerate(sel_underlyings):
+                            g = df[df["underlying"] == ul].sort_values("date").copy()
+                            color = palette[i % len(palette)]
+                            if single_ind:
+                                g = ind.add_std_bands(g, active_col, window=eff_window,
+                                                      n_sigma=band_sigma)
+                            if show_vol:
+                                fig_p.add_trace(go.Scatter(
+                                    x=g["date"], y=g["pcr_volume"],
+                                    name=f"{ul} · 成交量",
+                                    line=dict(color=color, width=2.2, dash="solid")))
+                            if show_oi:
+                                fig_p.add_trace(go.Scatter(
+                                    x=g["date"], y=g["pcr_oi"],
+                                    name=f"{ul} · 持仓量",
+                                    line=dict(color=color, width=2, dash="dot")))
+                            # 单一指标：叠加均值与 ±1σ/±2σ 轨道
+                            if single_ind:
+                                fig_p.add_trace(go.Scatter(
+                                    x=g["date"], y=g["mean"],
+                                    name=f"{ul} · 均值",
+                                    line=dict(color=color, width=1.2, dash="dash"),
+                                    opacity=0.6, showlegend=False))
+                                for lb, ub, dash in [("lower1", "upper1", "dot"),
+                                                     ("lower2", "upper2", "longdash")]:
+                                    fig_p.add_trace(go.Scatter(
+                                        x=g["date"], y=g[ub], line=dict(
+                                            color=color, width=1, dash=dash),
+                                        opacity=0.35, showlegend=False,
+                                        hoverinfo="skip"))
+                                    fig_p.add_trace(go.Scatter(
+                                        x=g["date"], y=g[lb], line=dict(
+                                            color=color, width=1, dash=dash),
+                                        opacity=0.35, showlegend=False,
+                                        fill="tonexty",
+                                        fillcolor=_hex_to_rgba(color, 0.06)
+                                        if lb == "lower2" else None,
+                                        hoverinfo="skip"))
+                        fig_p.add_hline(y=1.0, line_dash="dash", line_color=C_GRAY,
+                                        annotation_text="PCR=1（多空均衡）",
+                                        annotation_position="top right")
+                        fig_p.update_layout(
+                            height=460, margin=dict(l=10, r=10, t=30, b=10),
+                            yaxis_title="Put / Call Ratio", hovermode="x unified",
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+                            xaxis=dict(
+                                rangeslider=dict(visible=True, thickness=0.06),
+                                rangeselector=dict(buttons=list([
+                                    dict(count=1, label="1月", step="month", stepmode="backward"),
+                                    dict(count=3, label="3月", step="month", stepmode="backward"),
+                                    dict(count=6, label="6月", step="month", stepmode="backward"),
+                                    dict(step="all", label="全部"),
+                                ])),
+                            ),
+                        )
+                        add_index_overlay(fig_p, ol_pcr, df["date"].min(), df["date"].max())
+                        st.plotly_chart(fig_p, width="stretch")
+                        cap = "实线 = 成交量 PCR（当日情绪）；虚线 = 持仓量 PCR（中期仓位）。"
+                        if single_ind:
+                            cap += (f"当前为单一指标，已叠加 ±{band_sigma:.1f}σ 填充区间"
+                                    f"（有效窗口 {eff_window} 个交易日）；点线=±1σ，长虚线=±2σ。")
+                            if eff_window < band_window:
+                                cap += f" 数据不足，窗口已从 {band_window} 自动缩减。"
+                        else:
+                            cap += "同一标的使用相同颜色便于对比。"
+                        st.caption(cap)
+
+                        with st.expander(f"📋 最新日分标的明细（{latest_d.strftime('%Y-%m-%d')}）"):
+                            show_df = today_df[["underlying", "call_volume", "put_volume", "pcr_volume",
+                                                "call_oi", "put_oi", "pcr_oi"]].copy()
+                            for c in ["pcr_volume", "pcr_oi"]:
+                                show_df[c] = show_df[c].round(3)
+                            st.dataframe(show_df.rename(columns={
+                                "underlying": "标的", "call_volume": "认购成交量",
+                                "put_volume": "认沽成交量", "pcr_volume": "成交量PCR",
+                                "call_oi": "认购持仓", "put_oi": "认沽持仓",
+                                "pcr_oi": "持仓量PCR"}), width="stretch", hide_index=True)
     except Exception as e:
         st.error(f"期权 PCR 模块加载失败：{type(e).__name__}: {e}")
 
@@ -288,8 +710,9 @@ with tab_pcr:
 # ---------------------------------------------------------------------------
 with tab_basis:
     try:
-        with st.spinner(f"逐日回溯抓取近 {lookback_days} 个自然日中金所行情…"):
-            basis = dfetch.get_index_futures_basis_history(lookback_days)
+        with st.spinner(f"逐日回溯抓取近 {futures_lookback} 个自然日中金所行情…"):
+            basis = dfetch.get_index_futures_basis_history(futures_lookback)
+        show_data_sources([("股指期货升贴水", "get_index_futures_basis_history")])
         if basis.empty:
             st.warning("未获取到股指期货数据。")
         else:
@@ -308,6 +731,7 @@ with tab_basis:
                 if v in b_now.index:
                     st.caption(f"· {v}（{b_now.loc[v]['variety_name']}）：{ind.basis_signal(b_now.loc[v]['basis_pct'])}")
 
+            ol_basis = st.multiselect("叠加指数走势（右轴）", COMMON_INDICES, key="overlay_basis")
             fig_b = go.Figure()
             palette = {"IF": C_BLUE, "IH": C_RED, "IC": C_GREEN, "IM": C_ORANGE}
             for v, g in basis.groupby("variety"):
@@ -318,6 +742,7 @@ with tab_basis:
             fig_b.update_layout(height=440, margin=dict(l=10, r=10, t=30, b=10),
                                 yaxis_title="主力基差率 %", hovermode="x unified",
                                 legend=dict(orientation="h", y=1.08))
+            add_index_overlay(fig_b, ol_basis, basis["date"].min(), basis["date"].max())
             st.plotly_chart(fig_b, width="stretch")
             st.caption("数据源：中金所官方日行情（成交量最大合约视为主力）＋新浪现货指数。")
     except Exception as e:
@@ -332,6 +757,7 @@ with tab_gold:
         try:
             with st.spinner("拉取上期所 AU 合约行情…"):
                 au = dfetch.get_gold_curve_latest()
+            show_data_sources([("黄金期货期限结构（上期所 AU）", "get_gold_curve_latest")])
             if au.empty:
                 st.warning("未获取到上期所黄金合约数据。")
             else:
@@ -367,6 +793,7 @@ with tab_gold:
         try:
             with st.spinner(f"拉取近 {cot_years} 年 CFTC COT 报告（周频）…"):
                 cot = dfetch.get_cot_gold(cot_years)
+            show_data_sources([("COMEX 黄金 CFTC COT 持仓", "get_cot_gold")])
             if cot.empty:
                 st.warning("未获取到 CFTC 持仓数据。")
             else:
@@ -415,8 +842,11 @@ with tab_gold:
 # ---------------------------------------------------------------------------
 with tab_citic:
     try:
-        with st.spinner(f"逐日回溯抓取近 {lookback_days} 个自然日中信期货持仓排名（中金所，首次较慢）…"):
-            citic = dfetch.get_citic_position_history(lookback_days)
+        citic = _fetch_with_progress(
+            f"citic_{futures_lookback}",
+            "正在逐日回溯拉取中信期货持仓（首次较慢，请稍候）…",
+            dfetch.get_citic_position_history, futures_lookback)
+        show_data_sources([("中信期货多空持仓", "get_citic_position_history")])
         if citic.empty:
             st.warning("未获取到中信期货持仓数据（可能是非交易时段或中金所接口暂不可用）。")
         else:
@@ -499,6 +929,7 @@ with tab_citic:
 
                     # 单合约历史净持仓走势
                     st.markdown("##### 净持仓历史走势")
+                    ol_citic = st.multiselect("叠加指数走势（右轴）", COMMON_INDICES, key="overlay_citic")
                     fig_sn = go.Figure()
                     fig_sn.add_trace(go.Scatter(
                         x=single["date"], y=single["net_oi"], name="净持仓",
@@ -509,6 +940,7 @@ with tab_citic:
                     fig_sn.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10),
                                          yaxis_title="净持仓（手）", hovermode="x unified",
                                          showlegend=False)
+                    add_index_overlay(fig_sn, ol_citic, single["date"].min(), single["date"].max())
                     st.plotly_chart(fig_sn, width="stretch")
 
                     # 单合约多空对比
@@ -555,6 +987,7 @@ with tab_citic:
 
                     # 净持仓历史走势（每个合约一条线，同品种同色·不同线型）
                     st.markdown(f"##### 净持仓历史走势（{n_contracts} 个合约）")
+                    ol_citic = st.multiselect("叠加指数走势（右轴）", COMMON_INDICES, key="overlay_citic")
                     fig_n = go.Figure()
                     dash_styles = ["solid", "dash", "dot", "dashdot",
                                    "longdash", "longdashdot"]
@@ -572,6 +1005,7 @@ with tab_citic:
                     fig_n.update_layout(height=460, margin=dict(l=10, r=10, t=30, b=10),
                                         yaxis_title="净持仓（手）", hovermode="x unified",
                                         legend=dict(orientation="h", y=1.08))
+                    add_index_overlay(fig_n, ol_citic, df["date"].min(), df["date"].max())
                     st.plotly_chart(fig_n, width="stretch")
 
                     # 多空持仓对比（按合约分别显示，跟着多选框变动）

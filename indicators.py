@@ -59,8 +59,11 @@ def add_std_bands(df: pd.DataFrame, value_col: str = "erp",
     """
     out = df.copy()
     s = out[value_col]
-    out["mean"] = s.rolling(window, min_periods=max(12, window // 3)).mean()
-    out["std"] = s.rolling(window, min_periods=max(12, window // 3)).std(ddof=0)
+    # min_periods 不得超过 window，否则 pandas 抛 ValueError；
+    # 长窗口下需要更多初始样本才能得到稳定的统计量，至少取窗口的一半
+    minp = min(window, max(12, window // 2))
+    out["mean"] = s.rolling(window, min_periods=minp).mean()
+    out["std"] = s.rolling(window, min_periods=minp).std(ddof=1)  # 样本标准差，金融时序惯例
     out["upper1"] = out["mean"] + out["std"]
     out["lower1"] = out["mean"] - out["std"]
     out["upper2"] = out["mean"] + 2 * out["std"]
@@ -74,7 +77,8 @@ def rolling_percentile(series: pd.Series, window: int = 60) -> pd.Series:
     """滚动历史分位（0~100）：当前值在过去 window 期样本中的百分位。"""
     def _pct(x):
         return (x.iloc[:-1] <= x.iloc[-1]).mean() * 100 if len(x) > 1 else np.nan
-    return series.rolling(window, min_periods=max(12, window // 3)).apply(_pct, raw=False)
+    minp = min(window, max(12, window // 3))
+    return series.rolling(window, min_periods=minp).apply(_pct, raw=False)
 
 
 def erp_signal(latest_erp: float, upper: float, lower: float) -> tuple[str, str]:
