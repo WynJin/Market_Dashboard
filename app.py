@@ -42,7 +42,8 @@ C_BLUE, C_RED, C_GRAY, C_GREEN, C_ORANGE = "#1f5fbf", "#d6332a", "#9aa5b1", "#1a
 with st.sidebar:
     st.header("⚙️ 参数设置")
     pe_name = st.selectbox("息差定价基准（指数）", list(INDEX_MAP.keys()), index=0)
-    band_years = st.slider("轨道滚动窗口（年，月频样本）", 2, 8, 3)
+    band_days = st.slider("轨道滚动窗口（天）", 365, 2920, 1095, step=30,
+                          help="PE 为月频数据，内部按 30.44 天/月换算为滚动月数")
     sigma_k = st.slider("高亮轨道倍数 σ", 1.0, 2.5, 2.0, step=0.5)
     lookback_days = st.slider("PCR / 期指回溯自然日数", 20, 90, 45,
                               help="交易所历史接口按天回溯，越大越慢（已缓存）")
@@ -72,7 +73,8 @@ with tab_core:
             index_daily = dfetch.get_index_daily(sina_code)
 
         erp_df = ind.build_erp(pe_m, bond)
-        window = band_years * 12
+        idx_recent = index_daily[index_daily["date"] >= erp_df["date"].min()]
+        window = max(1, round(band_days / 30.44))  # 月频样本，按30.44天/月换算
         erp_df = ind.add_std_bands(erp_df, "erp", window=window, n_sigma=sigma_k)
         erp_df["pct_rank"] = ind.rolling_percentile(erp_df["erp"], window=max(window, 60))
         last = erp_df.iloc[-1]
@@ -87,42 +89,71 @@ with tab_core:
         c5.metric("数据截至", last["date"].strftime("%Y-%m"))
 
         st.info(f"**信号解读：** {sig_desc}。口径：ERP = 100/PE(TTM) − 10年期国债收益率（百分点）；"
-                f"轨道为近 {band_years} 年滚动均值 ± {sigma_k}σ。触上轨=股票见底，触下轨=见顶（与视频规则一致）。")
+                f"轨道为近 {band_days} 天（约 {window} 个月）滚动均值 ± {sigma_k}σ。触上轨=股票见底，触下轨=见顶（与视频规则一致）。")
+
+        # 日期范围筛选：支持只看某一段时期
+        erp_min = erp_df["date"].min().date()
+        erp_max = erp_df["date"].max().date()
+        date_range = st.date_input(
+            "📅 显示日期范围（可只看局部时段）",
+            value=(erp_min, erp_max),
+            min_value=erp_min, max_value=erp_max,
+            key="erp_date_range",
+        )
+        if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+            _sd, _ed = date_range
+            erp_show = erp_df[(erp_df["date"].dt.date >= _sd) & (erp_df["date"].dt.date <= _ed)]
+            idx_show = idx_recent[(idx_recent["date"].dt.date >= _sd) & (idx_recent["date"].dt.date <= _ed)]
+        else:
+            erp_show, idx_show = erp_df, idx_recent
+        st.caption(f"当前显示 {len(erp_show)} 个月数据 · 轨道基于全量历史滚动计算，仅显示范围被裁剪")
 
         fig = go.Figure()
         # ±2σ / ±1σ 浅色背景轨
-        fig.add_trace(go.Scatter(x=erp_df["date"], y=erp_df["upper2"], name="+2σ",
+        fig.add_trace(go.Scatter(x=erp_show["date"], y=erp_show["upper2"], name="+2σ",
                                  line=dict(width=1, color=C_GRAY), opacity=0.5,
                                  line_dash="dot", showlegend=True))
-        fig.add_trace(go.Scatter(x=erp_df["date"], y=erp_df["lower2"], name="-2σ",
+        fig.add_trace(go.Scatter(x=erp_show["date"], y=erp_show["lower2"], name="-2σ",
                                  line=dict(width=1, color=C_GRAY), opacity=0.5,
                                  line_dash="dot", showlegend=True))
-        fig.add_trace(go.Scatter(x=erp_df["date"], y=erp_df["upper1"], name="+1σ",
+        fig.add_trace(go.Scatter(x=erp_show["date"], y=erp_show["upper1"], name="+1σ",
                                  line=dict(width=1, color=C_GRAY), opacity=0.8,
                                  line_dash="dash", showlegend=True))
-        fig.add_trace(go.Scatter(x=erp_df["date"], y=erp_df["lower1"], name="-1σ",
+        fig.add_trace(go.Scatter(x=erp_show["date"], y=erp_show["lower1"], name="-1σ",
                                  line=dict(width=1, color=C_GRAY), opacity=0.8,
                                  line_dash="dash", showlegend=True))
-        fig.add_trace(go.Scatter(x=erp_df["date"], y=erp_df["mean"], name="滚动均值",
+        fig.add_trace(go.Scatter(x=erp_show["date"], y=erp_show["mean"], name="滚动均值",
                                  line=dict(width=1.5, color=C_ORANGE)))
-        fig.add_trace(go.Scatter(x=erp_df["date"], y=erp_df["erp"], name="股债息差 ERP（蓝线）",
+        fig.add_trace(go.Scatter(x=erp_show["date"], y=erp_show["erp"], name="股债息差 ERP（蓝线）",
                                  line=dict(width=2.6, color=C_BLUE)))
         # 高亮选定的 ±kσ 轨道
-        fig.add_trace(go.Scatter(x=erp_df["date"], y=erp_df["band_upper"],
+        fig.add_trace(go.Scatter(x=erp_show["date"], y=erp_show["band_upper"],
                                  name=f"上轨 +{sigma_k}σ",
                                  line=dict(width=2, color=C_GREEN), line_dash="dash"))
-        fig.add_trace(go.Scatter(x=erp_df["date"], y=erp_df["band_lower"],
+        fig.add_trace(go.Scatter(x=erp_show["date"], y=erp_show["band_lower"],
                                  name=f"下轨 −{sigma_k}σ",
                                  line=dict(width=2, color=C_RED), line_dash="dash"))
         # 大盘指数（次轴，红线，仅参考）
-        idx_recent = index_daily[index_daily["date"] >= erp_df["date"].min()]
-        fig.add_trace(go.Scatter(x=idx_recent["date"], y=idx_recent["close"],
+        fig.add_trace(go.Scatter(x=idx_show["date"], y=idx_show["close"],
                                  name=f"{pe_name}指数（右轴·仅参考）",
                                  line=dict(width=1.6, color=C_RED, dash="solid"),
                                  opacity=0.55, yaxis="y2"))
         fig.update_layout(
             height=560, hovermode="x unified",
             margin=dict(l=10, r=10, t=30, b=10),
+            xaxis=dict(
+                title="日期",
+                rangeslider=dict(visible=True, thickness=0.06),
+                rangeselector=dict(
+                    buttons=list([
+                        dict(count=1, label="1年", step="year", stepmode="backward"),
+                        dict(count=2, label="2年", step="year", stepmode="backward"),
+                        dict(count=3, label="3年", step="year", stepmode="backward"),
+                        dict(count=5, label="5年", step="year", stepmode="backward"),
+                        dict(step="all", label="全部"),
+                    ]),
+                ),
+            ),
             yaxis=dict(title="ERP（百分点）"),
             yaxis2=dict(title=f"{pe_name}点位", overlaying="y", side="right",
                         showgrid=False),
@@ -179,8 +210,22 @@ with tab_shibor:
             for i, t in enumerate(picked):
                 fig_h.add_trace(go.Scatter(x=shibor["date"], y=shibor[t], name=t,
                                            line=dict(width=1.8, color=palette[i % len(palette)])))
-            fig_h.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10),
-                                yaxis_title="SHIBOR %", hovermode="x unified")
+            fig_h.update_layout(
+                height=420, margin=dict(l=10, r=10, t=30, b=10),
+                yaxis_title="SHIBOR %", hovermode="x unified",
+                xaxis=dict(
+                    rangeslider=dict(visible=True, thickness=0.06),
+                    rangeselector=dict(
+                        buttons=list([
+                            dict(count=1, label="1月", step="month", stepmode="backward"),
+                            dict(count=3, label="3月", step="month", stepmode="backward"),
+                            dict(count=6, label="6月", step="month", stepmode="backward"),
+                            dict(count=1, label="1年", step="year", stepmode="backward"),
+                            dict(step="all", label="全部"),
+                        ]),
+                    ),
+                ),
+            )
             st.plotly_chart(fig_h, width="stretch")
         st.caption("数据源：shibor.org（全国银行间同业拆借中心）。短端利率飙升=资金面紧张，"
                    "视频中用于观察大资金流动性。")
@@ -344,9 +389,22 @@ with tab_gold:
                 fig_c.add_trace(go.Scatter(x=cot["date"], y=cot["mm_short"], name="空头",
                                            line=dict(color=C_GREEN, width=1.6)))
                 fig_c.add_hline(y=0, line_color=C_GRAY)
-                fig_c.update_layout(height=430, margin=dict(l=10, r=10, t=30, b=10),
-                                    yaxis_title="合约张数", hovermode="x unified",
-                                    legend=dict(orientation="h", y=1.08))
+                fig_c.update_layout(
+                    height=430, margin=dict(l=10, r=10, t=30, b=10),
+                    yaxis_title="合约张数", hovermode="x unified",
+                    legend=dict(orientation="h", y=1.08),
+                    xaxis=dict(
+                        rangeslider=dict(visible=True, thickness=0.06),
+                        rangeselector=dict(
+                            buttons=list([
+                                dict(count=6, label="6月", step="month", stepmode="backward"),
+                                dict(count=1, label="1年", step="year", stepmode="backward"),
+                                dict(count=2, label="2年", step="year", stepmode="backward"),
+                                dict(step="all", label="全部"),
+                            ]),
+                        ),
+                    ),
+                )
                 st.plotly_chart(fig_c, width="stretch")
                 st.caption("数据源：CFTC Disaggregated Futures-only 报告（COMEX Gold 代码 088691）。")
         except Exception as e:
@@ -362,89 +420,203 @@ with tab_citic:
         if citic.empty:
             st.warning("未获取到中信期货持仓数据（可能是非交易时段或中金所接口暂不可用）。")
         else:
-            # 按品种汇总（同一品种下所有合约相加）
-            agg = citic.groupby(["date", "variety"], as_index=False).agg(
-                long_oi=("long_oi", "sum"),
-                long_oi_chg=("long_oi_chg", "sum"),
-                short_oi=("short_oi", "sum"),
-                short_oi_chg=("short_oi_chg", "sum"),
-                net_oi=("net_oi", "sum"),
-            )
-            latest_d = agg["date"].max()
-            now = agg[agg["date"] == latest_d].set_index("variety")
-
-            st.subheader(f"中信期货股指期货多空持仓（{latest_d.strftime('%Y-%m-%d')}，单位：手）")
-            # 全品种合计
-            total_long = now["long_oi"].sum()
-            total_short = now["short_oi"].sum()
-            total_net = total_long - total_short
-            h1, h2, h3, h4 = st.columns(4)
-            h1.metric("合计多单", f"{total_long:,.0f}",
-                      f"日增减 {now['long_oi_chg'].sum():+,.0f}")
-            h2.metric("合计空单", f"{total_short:,.0f}",
-                      f"日增减 {now['short_oi_chg'].sum():+,.0f}")
-            h3.metric("合计净持仓", f"{total_net:+,.0f}",
-                      f"{'净多' if total_net >= 0 else '净空'}")
-            h4.metric("多空比", f"{total_long / total_short:.2f}" if total_short else "—")
-            st.caption("净持仓 = 多单 − 空单；正值净多、负值净空。"
-                       + ind.citic_net_signal(total_net, total_long, total_short))
-
-            # 分品种卡片
-            st.markdown("##### 分品种明细")
+            # 品种代码 -> 中文名称
+            VARIETY_NAMES = {"IF": "沪深300", "IH": "上证50",
+                             "IC": "中证500", "IM": "中证1000"}
             vpalette = {"IF": C_BLUE, "IH": C_RED, "IC": C_GREEN, "IM": C_ORANGE}
-            vcards = st.columns(len(now))
-            for col, v in zip(vcards, now.index):
-                r = now.loc[v]
-                col.metric(
-                    f"{v}",
-                    f"净 {r['net_oi']:+,.0f}",
-                    f"多 {r['long_oi']:,.0f} / 空 {r['short_oi']:,.0f}",
-                )
-                col.caption(f"多单增减 {r['long_oi_chg']:+,.0f} ｜ 空单增减 {r['short_oi_chg']:+,.0f}")
 
-            # 历史净持仓走势
-            st.markdown("##### 净持仓历史走势（分品种）")
-            fig_n = go.Figure()
-            for v, g in agg.groupby("variety"):
-                g = g.sort_values("date")
-                fig_n.add_trace(go.Scatter(
-                    x=g["date"], y=g["net_oi"], name=v, mode="lines",
-                    line=dict(color=vpalette.get(v, C_GRAY), width=2.2)))
-            fig_n.add_hline(y=0, line_color=C_GRAY, line_dash="dash")
-            fig_n.update_layout(height=440, margin=dict(l=10, r=10, t=30, b=10),
-                                yaxis_title="净持仓（手）", hovermode="x unified",
-                                legend=dict(orientation="h", y=1.08))
-            st.plotly_chart(fig_n, width="stretch")
+            latest_d = citic["date"].max()
+            st.subheader(f"中信期货股指期货多空持仓（{latest_d.strftime('%Y-%m-%d')}，单位：手）")
+            st.caption("品种对照：IF=沪深300 ｜ IH=上证50 ｜ IC=中证500 ｜ IM=中证1000")
 
-            # 多空持仓双线对比（合计）
-            st.markdown("##### 多空持仓对比（四品种合计）")
-            tot = agg.groupby("date", as_index=False).agg(
-                long_oi=("long_oi", "sum"), short_oi=("short_oi", "sum"))
-            fig_ls = go.Figure()
-            fig_ls.add_trace(go.Scatter(x=tot["date"], y=tot["long_oi"], name="多单持仓",
-                                        line=dict(color=C_RED, width=2.2)))
-            fig_ls.add_trace(go.Scatter(x=tot["date"], y=tot["short_oi"], name="空单持仓",
-                                        line=dict(color=C_GREEN, width=2.2)))
-            fig_ls.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10),
-                                 yaxis_title="持仓量（手）", hovermode="x unified",
-                                 legend=dict(orientation="h", y=1.08))
-            st.plotly_chart(fig_ls, width="stretch")
+            # ===== 筛选区：品种多选 + 到期月份多选 =====
+            def _contract_month(c: str) -> str:
+                return str(c)[2:6]  # IC2611 -> 2611
 
-            # 最新日分合约明细
-            with st.expander(f"📋 最新日分合约明细（{latest_d.strftime('%Y-%m-%d')}）"):
-                detail = citic[citic["date"] == latest_d][[
-                    "variety", "contract", "long_oi", "long_oi_chg", "long_rank",
-                    "short_oi", "short_oi_chg", "short_rank", "net_oi"]].copy()
-                for c in ["long_oi", "long_oi_chg", "short_oi", "short_oi_chg", "net_oi"]:
-                    detail[c] = detail[c].astype(int)
-                st.dataframe(detail.rename(columns={
-                    "variety": "品种", "contract": "合约",
-                    "long_oi": "多单持仓", "long_oi_chg": "多单增减", "long_rank": "多单排名",
-                    "short_oi": "空单持仓", "short_oi_chg": "空单增减", "short_rank": "空单排名",
-                    "net_oi": "净持仓",
-                }), width="stretch", hide_index=True)
-                st.caption("多单/空单排名指中信在该合约多头/空头前 20 名中的名次；"
-                           "若未进入前 20，对应持仓按 0 计（实际小于第 20 名）。")
+            citic = citic.copy()
+            citic["exp_month"] = citic["contract"].map(_contract_month)
+
+            all_varieties = sorted(citic["variety"].unique())
+            all_months = sorted(citic["exp_month"].unique())
+            cur_ym = pd.Timestamp.now().strftime("%y%m")  # 当前年月，标记已到期
+
+            # 默认选最近 2 个存续中月份（已到期的不默认选中，避免下拉框全选后显示 no results）
+            ongoing_months = [m for m in all_months if m >= cur_ym]
+            default_months = ongoing_months[:2] if ongoing_months else all_months[:2]
+
+            c1, c2 = st.columns(2)
+            with c1:
+                sel_varieties = st.multiselect(
+                    "品种（可多选）", all_varieties, default=all_varieties,
+                    format_func=lambda v: f"{v} {VARIETY_NAMES.get(v, '')}",
+                    key="citic_sel_varieties")
+            with c2:
+                month_labels = {
+                    m: f"20{m[:2]}-{m[2:]}（{'已到期' if m < cur_ym else '存续中'}）"
+                    for m in all_months
+                }
+                sel_months = st.multiselect(
+                    "到期月份（可多选）", all_months, default=default_months,
+                    format_func=lambda m: month_labels[m],
+                    help="默认展示最近 2 个存续中月份；已到期合约仍可勾选查看其历史",
+                    key="citic_sel_months")
+
+            if not sel_varieties or not sel_months:
+                st.warning("请至少选择一个品种和一个到期月份。")
+            else:
+                df = citic[citic["variety"].isin(sel_varieties) &
+                           citic["exp_month"].isin(sel_months)].copy()
+                n_contracts = df["contract"].nunique()
+
+                if n_contracts == 0:
+                    st.info("当前筛选条件下无数据。")
+                elif n_contracts == 1:
+                    # ---------- 单合约视图 ----------
+                    single = df.sort_values("date").copy()
+                    contract_code = single["contract"].iloc[0]
+                    variety = single["variety"].iloc[0]
+                    vname = VARIETY_NAMES.get(variety, variety)
+                    last = single.iloc[-1]
+                    s_long = float(last["long_oi"])
+                    s_short = float(last["short_oi"])
+                    s_net = float(last["net_oi"])
+                    is_expired = single["exp_month"].iloc[0] < cur_ym
+
+                    st.markdown(f"##### {contract_code}（{variety} {vname}）"
+                                f"{' · 已到期' if is_expired else ''}")
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("多单持仓", f"{s_long:,.0f}",
+                              f"日增减 {last['long_oi_chg']:+,.0f}")
+                    m2.metric("空单持仓", f"{s_short:,.0f}",
+                              f"日增减 {last['short_oi_chg']:+,.0f}")
+                    m3.metric("净持仓", f"{s_net:+,.0f}",
+                              f"{'净多' if s_net >= 0 else '净空'}")
+                    m4.metric("多空比", f"{s_long / s_short:.2f}" if s_short else "—")
+                    m5.metric("多单/空单排名",
+                              f"第{int(last['long_rank'])}名 / 第{int(last['short_rank'])}名"
+                              if pd.notna(last["long_rank"]) and pd.notna(last["short_rank"]) else "—")
+                    st.caption(ind.citic_net_signal(s_net, s_long, s_short))
+
+                    # 单合约历史净持仓走势
+                    st.markdown("##### 净持仓历史走势")
+                    fig_sn = go.Figure()
+                    fig_sn.add_trace(go.Scatter(
+                        x=single["date"], y=single["net_oi"], name="净持仓",
+                        mode="lines+markers",
+                        line=dict(color=vpalette.get(variety, C_BLUE), width=2.4),
+                        marker=dict(size=6)))
+                    fig_sn.add_hline(y=0, line_color=C_GRAY, line_dash="dash")
+                    fig_sn.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10),
+                                         yaxis_title="净持仓（手）", hovermode="x unified",
+                                         showlegend=False)
+                    st.plotly_chart(fig_sn, width="stretch")
+
+                    # 单合约多空对比
+                    st.markdown("##### 多空持仓对比")
+                    fig_sl = go.Figure()
+                    fig_sl.add_trace(go.Scatter(x=single["date"], y=single["long_oi"],
+                                                name="多单持仓",
+                                                line=dict(color=C_RED, width=2.2)))
+                    fig_sl.add_trace(go.Scatter(x=single["date"], y=single["short_oi"],
+                                                name="空单持仓",
+                                                line=dict(color=C_GREEN, width=2.2)))
+                    fig_sl.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10),
+                                         yaxis_title="持仓量（手）", hovermode="x unified",
+                                         legend=dict(orientation="h", y=1.08))
+                    st.plotly_chart(fig_sl, width="stretch")
+
+                else:
+                    # ---------- 多合约视图：汇总 + 按合约对比 ----------
+                    agg = df.groupby(["date", "variety"], as_index=False).agg(
+                        long_oi=("long_oi", "sum"),
+                        long_oi_chg=("long_oi_chg", "sum"),
+                        short_oi=("short_oi", "sum"),
+                        short_oi_chg=("short_oi_chg", "sum"),
+                        net_oi=("net_oi", "sum"),
+                    )
+                    now = agg[agg["date"] == latest_d].set_index("variety")
+
+                    if now.empty:
+                        st.info("所选合约均已到期，最新交易日无持仓数据，请查看下方历史走势。")
+                    else:
+                        total_long = now["long_oi"].sum()
+                        total_short = now["short_oi"].sum()
+                        total_net = total_long - total_short
+                        h1, h2, h3, h4 = st.columns(4)
+                        h1.metric("合计多单", f"{total_long:,.0f}",
+                                  f"日增减 {now['long_oi_chg'].sum():+,.0f}")
+                        h2.metric("合计空单", f"{total_short:,.0f}",
+                                  f"日增减 {now['short_oi_chg'].sum():+,.0f}")
+                        h3.metric("合计净持仓", f"{total_net:+,.0f}",
+                                  f"{'净多' if total_net >= 0 else '净空'}")
+                        h4.metric("多空比", f"{total_long / total_short:.2f}" if total_short else "—")
+                        st.caption("净持仓 = 多单 − 空单；正值净多、负值净空。"
+                                   + ind.citic_net_signal(total_net, total_long, total_short))
+
+                    # 净持仓历史走势（每个合约一条线，同品种同色·不同线型）
+                    st.markdown(f"##### 净持仓历史走势（{n_contracts} 个合约）")
+                    fig_n = go.Figure()
+                    dash_styles = ["solid", "dash", "dot", "dashdot",
+                                   "longdash", "longdashdot"]
+                    for i, (contract, g) in enumerate(
+                            df.groupby("contract", sort=True)):
+                        g = g.sort_values("date")
+                        v = g["variety"].iloc[0]
+                        fig_n.add_trace(go.Scatter(
+                            x=g["date"], y=g["net_oi"],
+                            name=f"{contract}（{VARIETY_NAMES.get(v, '')}）",
+                            mode="lines",
+                            line=dict(color=vpalette.get(v, C_GRAY), width=2.2,
+                                      dash=dash_styles[i % len(dash_styles)])))
+                    fig_n.add_hline(y=0, line_color=C_GRAY, line_dash="dash")
+                    fig_n.update_layout(height=460, margin=dict(l=10, r=10, t=30, b=10),
+                                        yaxis_title="净持仓（手）", hovermode="x unified",
+                                        legend=dict(orientation="h", y=1.08))
+                    st.plotly_chart(fig_n, width="stretch")
+
+                    # 多空持仓对比（按合约分别显示，跟着多选框变动）
+                    st.markdown(f"##### 多空持仓对比（{n_contracts} 个合约）")
+                    fig_ls = go.Figure()
+                    for contract, g in df.groupby("contract", sort=True):
+                        g = g.sort_values("date")
+                        v = g["variety"].iloc[0]
+                        color = vpalette.get(v, C_GRAY)
+                        # 多单实线、空单虚线，同品种同色
+                        fig_ls.add_trace(go.Scatter(
+                            x=g["date"], y=g["long_oi"], name=f"{contract} 多单",
+                            line=dict(color=color, width=2, dash="solid")))
+                        fig_ls.add_trace(go.Scatter(
+                            x=g["date"], y=g["short_oi"], name=f"{contract} 空单",
+                            line=dict(color=color, width=2, dash="dash")))
+                    fig_ls.update_layout(height=440, margin=dict(l=10, r=10, t=30, b=10),
+                                         yaxis_title="持仓量（手）", hovermode="x unified",
+                                         legend=dict(orientation="h", y=1.08))
+                    st.plotly_chart(fig_ls, width="stretch")
+
+                # 最新日分合约明细（仅展示筛选后的合约）
+                with st.expander(f"📋 最新日分合约明细（{latest_d.strftime('%Y-%m-%d')}）"):
+                    detail = df[df["date"] == latest_d][[
+                        "variety", "contract", "long_oi", "long_oi_chg", "long_rank",
+                        "short_oi", "short_oi_chg", "short_rank", "net_oi"]].copy()
+                    if detail.empty:
+                        st.caption("最新日无筛选合约的数据。")
+                    else:
+                        for c in ["long_oi", "long_oi_chg", "short_oi",
+                                  "short_oi_chg", "net_oi"]:
+                            detail[c] = detail[c].astype(int)
+                        detail["品种"] = detail["variety"].map(
+                            lambda x: f"{x} {VARIETY_NAMES.get(x, '')}")
+                        st.dataframe(detail[[
+                            "品种", "contract", "long_oi", "long_oi_chg", "long_rank",
+                            "short_oi", "short_oi_chg", "short_rank", "net_oi"]].rename(
+                            columns={
+                                "contract": "合约",
+                                "long_oi": "多单持仓", "long_oi_chg": "多单增减", "long_rank": "多单排名",
+                                "short_oi": "空单持仓", "short_oi_chg": "空单增减", "short_rank": "空单排名",
+                                "net_oi": "净持仓",
+                            }), width="stretch", hide_index=True)
+                        st.caption("多单/空单排名指中信在该合约多头/空头前 20 名中的名次；"
+                                   "若未进入前 20，对应持仓按 0 计（实际小于第 20 名）。")
 
             st.caption("数据源：中金所每日前 20 会员持仓排名（成交量/持买单/持卖单）；"
                        "中信期货为国内最大期货经纪商，其代客持仓方向常被视为大资金情绪风向标。")
