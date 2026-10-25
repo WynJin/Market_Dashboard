@@ -48,6 +48,7 @@ TUSHARE_API_URL = os.getenv("TUSHARE_API_URL", _cfg.get("tushare_api_url", ""))
 METHOD_ROUTING: dict[str, list[str]] = {
     "get_bond_10y":                  ["akshare"],              # 实测代理不支持债券接口
     "get_index_pe_monthly":          ["tushare", "akshare"],
+    "get_index_pe_daily":            ["tushare", "akshare"],
     "get_index_pe_daily_csindex":    ["tushare", "akshare"],
     "get_index_daily":               ["tushare", "akshare"],
     "get_shibor":                    ["akshare", "tushare"],   # akshare 一次拿全历史更快
@@ -58,6 +59,15 @@ METHOD_ROUTING: dict[str, list[str]] = {
     "get_gold_curve_latest":         ["akshare", "tushare"],
     "get_gold_main_daily":           ["akshare", "tushare"],
     "get_cot_gold":                  ["akshare"],              # 只有 cftc.gov 直连
+    # 离岸在岸息差系统
+    "get_effr":                      ["akshare"],              # FRED API，tushare 无此接口
+    "get_sofr_futures":              ["akshare"],              # yfinance / FRED，tushare 无
+    "get_cnh_hibor":                 ["akshare"],              # 东方财富，tushare 无
+    "get_usd_cny":                   ["akshare"],              # 央行中间价，tushare 无
+    "get_usd_cnh":                   ["akshare"],              # 东方财富 push2his / 新浪，tushare 无
+    "get_bond_yield_curve":          ["akshare"],              # 中国国债信息网
+    "get_us_macro_events":           ["akshare"],              # FRED DFEDTARU/CPIAUCSL/PPIACO
+    "get_us_treasury_yields":        ["akshare"],              # FRED DGS* 系列
 }
 
 

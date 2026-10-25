@@ -49,6 +49,31 @@ def build_erp(pe_monthly: pd.DataFrame, bond_daily: pd.DataFrame) -> pd.DataFram
     return merged.dropna(subset=["erp"]).reset_index(drop=True)
 
 
+def build_erp_daily(pe_daily: pd.DataFrame, bond_daily: pd.DataFrame) -> pd.DataFrame:
+    """
+    用日频 PE 与日频国债收益率构造日频股债风险溢价序列。
+
+    输入:
+      pe_daily  : columns [date, pe_ttm]（交易日）
+      bond_daily: columns [date, bond_yield]（日频）
+    返回:
+      columns [date, pe_ttm, earnings_yield, bond_yield, erp, erp_reverse]
+      erp = E/P - 10Y
+    两者均为日频但交易日可能不完全对齐（如节假日差异），用 merge_asof backward
+    取不晚于 PE 日期的最近一个国债收益率。
+    """
+    pe = pe_daily.sort_values("date").copy()
+    bond = bond_daily.sort_values("date").copy()
+    pe["ey"] = earnings_yield(pe["pe_ttm"])
+    merged = pd.merge_asof(
+        pe.rename(columns={"ey": "earnings_yield"}),
+        bond, on="date", direction="backward",
+    )
+    merged["erp"] = merged["earnings_yield"] - merged["bond_yield"]
+    merged["erp_reverse"] = merged["bond_yield"] - merged["earnings_yield"]
+    return merged.dropna(subset=["erp"]).reset_index(drop=True)
+
+
 def add_std_bands(df: pd.DataFrame, value_col: str = "erp",
                   window: int = 36, n_sigma: float = 2.0) -> pd.DataFrame:
     """
@@ -146,4 +171,98 @@ def citic_net_signal(net_oi: float, long_oi: float, short_oi: float) -> str:
     if net_oi < 0:
         return "中信小幅净空，方向偏空"
     return "多空基本均衡"
+
+
+# ===========================================================================
+# 离岸在岸息差系统
+# ===========================================================================
+def build_usd_offshore_onshore_spread(effr: pd.DataFrame,
+                                      sr3: pd.DataFrame) -> pd.DataFrame:
+    """美元离岸-在岸息差 = 隐含离岸利率 - EFFR。
+
+    输入:
+      effr : columns [date, effr]  有效联邦基金利率(%)
+      sr3  : columns [date, sr3_close]  3个月SOFR期货收盘价
+    返回:
+      columns [date, effr, sr3_close, implied_offshore, spread_pct, spread_bp]
+      implied_offshore = 100 - sr3_close
+      spread_pct = implied_offshore - effr
+      spread_bp  = spread_pct * 100
+    """
+    df = pd.merge(effr, sr3, on="date", how="inner").sort_values("date").reset_index(drop=True)
+    df["implied_offshore"] = 100.0 - df["sr3_close"]
+    df["spread_pct"] = df["implied_offshore"] - df["effr"]
+    df["spread_bp"] = df["spread_pct"] * 100.0
+    return df
+
+
+def build_cny_rate_spread(cnh_hibor: pd.DataFrame,
+                          shibor: pd.DataFrame) -> pd.DataFrame:
+    """人民币离在岸息差 = 3M CNH Hibor - 3M Shibor。
+
+    输入:
+      cnh_hibor : columns [date, cnh_hibor_3m]（离岸人民币拆借利率 %）
+      shibor    : columns [date, 3个月]（在岸 SHIBOR %）
+    返回:
+      columns [date, cnh_hibor_3m, shibor_3m, spread_pct, spread_bp]
+    """
+    sh = shibor[["date", "3个月"]].rename(columns={"3个月": "shibor_3m"}).copy()
+    df = pd.merge(cnh_hibor, sh, on="date", how="inner").sort_values("date").reset_index(drop=True)
+    df["spread_pct"] = df["cnh_hibor_3m"] - df["shibor_3m"]
+    df["spread_bp"] = df["spread_pct"] * 100.0
+    return df
+
+
+def build_cny_fx_spread(usd_cnh: pd.DataFrame,
+                        usd_cny: pd.DataFrame) -> pd.DataFrame:
+    """人民币离在岸汇差 = (USD/CNH - USD/CNY) × 10000（单位 bp）。
+
+    汇差为正 → 离岸贬值预期强于在岸（外资看空人民币资产）。
+    """
+    df = pd.merge(usd_cnh, usd_cny, on="date", how="inner").sort_values("date").reset_index(drop=True)
+    df["spread_bp"] = (df["usd_cnh"] - df["usd_cny"]) * 10000.0
+    return df
+
+
+def build_bond_term_spread(bond_curve: pd.DataFrame) -> pd.DataFrame:
+    """国债长短端利差 = 10Y - 2Y（单位 %）。
+
+    输入: columns [date, bond_2y, bond_10y]
+    返回: columns [date, bond_2y, bond_10y, spread_pct]
+    """
+    df = bond_curve.copy()
+    df["spread_pct"] = df["bond_10y"] - df["bond_2y"]
+    return df.dropna(subset=["spread_pct"]).reset_index(drop=True)
+
+
+def build_erp_from_curve(pe_monthly: pd.DataFrame,
+                         bond_curve: pd.DataFrame) -> pd.DataFrame:
+    """A股股债收益差 = 沪深300盈利收益率 - 10Y国债收益率。
+
+    复用 build_erp 的逻辑，但接受 bond_yield_curve 输出（含 10Y 列）。
+    """
+    bond = bond_curve[["date", "bond_10y"]].rename(columns={"bond_10y": "bond_yield"}).copy()
+    return build_erp(pe_monthly, bond)
+
+
+def resonance_signal(fx_spread_bp: float, rate_spread_bp: float,
+                     erp_percentile: float, term_spread_pct: float
+                     ) -> tuple[str, str]:
+    """内外资金共振判断。
+
+    外部资金流入信号：汇差收窄(fx_spread_bp < 0) 且 息差收窄(rate_spread_bp < 0)
+    内部吸引力强：ERP 历史分位 > 50（股优于债）
+    返回 (象限标签, 解读)
+    """
+    external_in = (pd.notna(fx_spread_bp) and fx_spread_bp < 0
+                   and pd.notna(rate_spread_bp) and rate_spread_bp < 0)
+    internal_strong = pd.notna(erp_percentile) and erp_percentile > 50
+
+    if external_in and internal_strong:
+        return ("内外资金共振做多", "外资流入 + 股债收益差高位 → 牛市底部/启动期，指数级行情概率高")
+    if (not external_in) and (not internal_strong):
+        return ("内外资金共振撤离", "外资流出 + 股债收益差低位 → 熊市风险高，整体持续承压")
+    if external_in and (not internal_strong):
+        return ("外资主导结构性行情", "外资流入但内部吸引力弱 → 指数震荡，外资重仓赛道相对强势")
+    return ("内资主导修复行情", "外资流出但内部吸引力强 → 政策与内资驱动，外资重仓板块偏弱")
 #（注：内容由AI生成）

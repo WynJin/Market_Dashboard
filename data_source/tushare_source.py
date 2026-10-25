@@ -41,6 +41,7 @@ FUTURES_VARIETY = {
 # ------------------------------------------------------------------
 SOURCE_CHANNELS = {
     "get_index_pe_monthly": "Tushare Pro index_dailybasic（中证指数），日频聚合为月频",
+    "get_index_pe_daily": "Tushare Pro index_dailybasic（中证指数），日频",
     "get_index_pe_daily_csindex": "Tushare Pro index_dailybasic（中证指数），日频",
     "get_index_daily": "Tushare Pro index_daily，日频",
     "get_shibor": "Tushare Pro shibor（全国银行间同业拆借中心），日频",
@@ -108,6 +109,20 @@ class TushareSource(DataSource):
         # 取每月最后一个交易日作为月频样本
         df = df.set_index("date").resample("ME").last().dropna().reset_index()
         return df.reset_index(drop=True)
+
+    # ------------------------------------------------------------------
+    # 2b. 指数市盈率（日频，全历史）：直接取 index_dailybasic 的每日 pe_ttm
+    # ------------------------------------------------------------------
+    def get_index_pe_daily(self, symbol: str = "沪深300") -> pd.DataFrame:
+        ts_code = PE_INDEX_TS.get(symbol, "000300.SH")
+        raw = self.pro.index_dailybasic(ts_code=ts_code)
+        if raw is None or len(raw) == 0:
+            return pd.DataFrame(columns=["date", "pe_ttm"])
+        df = raw[["trade_date", "pe_ttm"]].copy()
+        df.columns = ["date", "pe_ttm"]
+        df["date"] = to_dt(df["date"])
+        df["pe_ttm"] = pd.to_numeric(df["pe_ttm"], errors="coerce")
+        return df.dropna().sort_values("date").reset_index(drop=True)
 
     # ------------------------------------------------------------------
     # 3. 指数市盈率（日频）
@@ -256,8 +271,8 @@ class TushareSource(DataSource):
                 put_volume=("vol", "sum"), put_oi=("oi", "sum"))
             day_df = call.merge(put, on=grp_keys, how="outer").fillna(0)
             day_df["date"] = ts
-            day_df["pcr_volume"] = day_df["put_volume"] / day_df["call_volume"].replace(0, pd.NA)
-            day_df["pcr_oi"] = day_df["put_oi"] / day_df["call_oi"].replace(0, pd.NA)
+            day_df["pcr_volume"] = day_df["put_volume"] / day_df["call_volume"].mask(day_df["call_volume"] == 0)
+            day_df["pcr_oi"] = day_df["put_oi"] / day_df["call_oi"].mask(day_df["call_oi"] == 0)
             frames.append(day_df)
             if _progress_callback:
                 _progress_callback(i + 1, total)
@@ -409,3 +424,24 @@ class TushareSource(DataSource):
     # ------------------------------------------------------------------
     def get_cot_gold(self, years: int = 3) -> pd.DataFrame:
         raise NotImplementedError("Tushare 不提供 CFTC COT 数据，走 cftc.gov 直连（akshare 适配器）")
+
+    # ------------------------------------------------------------------
+    # 11-16. 离岸在岸息差系统：tushare 无对应接口，全部降级到 akshare
+    # ------------------------------------------------------------------
+    def get_effr(self, start_date: str = "20200101") -> pd.DataFrame:
+        raise NotImplementedError("Tushare 无 EFFR 接口，走 FRED（akshare 适配器）")
+
+    def get_sofr_futures(self, start_date: str = "20200101") -> pd.DataFrame:
+        raise NotImplementedError("Tushare 无 SOFR 期货接口，走 yfinance/FRED（akshare 适配器）")
+
+    def get_cnh_hibor(self) -> pd.DataFrame:
+        raise NotImplementedError("Tushare 无 CNH Hibor 接口，走东方财富（akshare 适配器）")
+
+    def get_usd_cny(self) -> pd.DataFrame:
+        raise NotImplementedError("Tushare 无 USD/CNY 汇率接口，走央行中间价（akshare 适配器）")
+
+    def get_usd_cnh(self) -> pd.DataFrame:
+        raise NotImplementedError("Tushare 无 USD/CNH 汇率接口，走 yfinance/新浪（akshare 适配器）")
+
+    def get_bond_yield_curve(self, start_date: str = "20100101") -> pd.DataFrame:
+        raise NotImplementedError("Tushare 无国债收益率曲线接口，走中国国债信息网（akshare 适配器）")

@@ -8,12 +8,16 @@ __pycache__/
 .venv/
 venv/
 env/
+tests/
 
 # Streamlit
 .streamlit/secrets.toml
 
 # 日志
 *.log
+
+# 指数分钟数据本地缓存
+data/minute_cache/
 
 # 操作系统
 .DS_Store

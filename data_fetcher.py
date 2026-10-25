@@ -93,6 +93,12 @@ def get_index_pe_monthly(symbol: str = "沪深300") -> pd.DataFrame:
 
 
 @cache_data(ttl=12 * 3600)
+def get_index_pe_daily(symbol: str = "沪深300") -> pd.DataFrame:
+    """指数市盈率（日频，全历史），返回列: date, pe_ttm"""
+    return _ds.get_index_pe_daily(symbol)
+
+
+@cache_data(ttl=12 * 3600)
 def get_index_pe_daily_csindex(csindex_code: str = "000300") -> pd.DataFrame:
     """指数市盈率（日频），返回列: date, pe_static, pe_ttm, div_yield"""
     return _ds.get_index_pe_daily_csindex(csindex_code)
@@ -102,6 +108,121 @@ def get_index_pe_daily_csindex(csindex_code: str = "000300") -> pd.DataFrame:
 def get_index_daily(sina_code: str = "sh000300") -> pd.DataFrame:
     """大盘指数日线，返回列: date, open, high, low, close, volume"""
     return _ds.get_index_daily(sina_code)
+
+
+# ---------------------------------------------------------------------------
+# 指数分钟数据本地缓存 + K 线构建
+# ---------------------------------------------------------------------------
+from pathlib import Path as _Path
+
+_MINUTE_CACHE_DIR = _Path(__file__).resolve().parent / "data" / "minute_cache"
+_MINUTE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_index_minute_cached(sina_code: str = "sh000016") -> pd.DataFrame:
+    """获取指数分钟数据并本地持久化缓存。
+
+    akshare 新浪接口仅返回最近约 5 个交易日的 1 分钟数据，
+    每次调用时：读取本地已有缓存 → 拉取最新增量 → 合并去重 → 写回缓存。
+    返回列: day(datetime), open, high, low, close, volume, amount
+    """
+    import akshare as ak
+
+    cache_file = _MINUTE_CACHE_DIR / f"{sina_code}.parquet"
+    # 1. 读取已有缓存
+    old = pd.DataFrame()
+    if cache_file.exists():
+        try:
+            old = pd.read_parquet(cache_file)
+        except Exception:
+            old = pd.DataFrame()
+    # 2. 拉取最新分钟数据（新浪仅返回最近几天）
+    try:
+        new = ak.stock_zh_a_minute(symbol=sina_code, period="1")
+    except Exception:
+        new = pd.DataFrame()
+    # 3. 合并去重
+    if not new.empty:
+        new["day"] = pd.to_datetime(new["day"])
+        for c in ["open", "high", "low", "close", "volume", "amount"]:
+            if c in new.columns:
+                new[c] = pd.to_numeric(new[c], errors="coerce")
+        combined = pd.concat([old, new], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["day"], keep="last")
+        combined = combined.sort_values("day").reset_index(drop=True)
+    else:
+        combined = old
+    # 4. 写回缓存
+    if not combined.empty:
+        try:
+            combined.to_parquet(cache_file, index=False)
+        except Exception:
+            pass  # 缓存写入失败不影响返回
+    return combined
+
+
+def get_index_kline(sina_code: str = "sh000016",
+                    lookback_days: int = 120) -> pd.DataFrame:
+    """构建指数日 K 线：分钟数据聚合 OHLC + tushare 日线成交量。
+
+    规则：
+    - 有分钟数据的日期：OHLC 由分钟数据聚合，成交量用 tushare 日线
+    - 无分钟数据的日期：open = 昨日 close（来自 tushare 日线），
+      high/low/close 用 tushare 日线，成交量用 tushare 日线
+    返回列: date, open, high, low, close, volume
+    """
+    # tushare 日线（含 OHLCV，全历史）
+    daily = get_index_daily(sina_code)
+    if daily.empty:
+        return pd.DataFrame()
+    daily = daily.sort_values("date").reset_index(drop=True)
+    # 截取 lookback
+    daily = daily.tail(lookback_days).reset_index(drop=True)
+
+    # 分钟数据聚合为日 OHLC
+    minute = get_index_minute_cached(sina_code)
+    minute_daily = pd.DataFrame()
+    if not minute.empty:
+        minute = minute.copy()
+        minute["date"] = minute["day"].dt.normalize()
+        minute_daily = minute.groupby("date", as_index=False).agg(
+            open=("open", "first"),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", "last"),
+        )
+
+    # 合并：优先用分钟 OHLC，缺失用 tushare 日线补齐
+    daily = daily.copy()
+    daily["date"] = pd.to_datetime(daily["date"]).dt.normalize()
+    if not minute_daily.empty:
+        merged = daily.merge(minute_daily, on="date", how="left",
+                             suffixes=("", "_min"))
+        # 有分钟数据的用分钟 OHLC
+        has_min = merged["open_min"].notna()
+        merged.loc[has_min, "open"] = merged.loc[has_min, "open_min"]
+        merged.loc[has_min, "high"] = merged.loc[has_min, "high_min"]
+        merged.loc[has_min, "low"] = merged.loc[has_min, "low_min"]
+        merged.loc[has_min, "close"] = merged.loc[has_min, "close_min"]
+        merged = merged.drop(columns=[c for c in merged.columns
+                                      if c.endswith("_min")])
+    else:
+        merged = daily
+
+    # 无分钟数据的日期：open = 昨日 close
+    merged["prev_close"] = merged["close"].shift(1)
+    no_min_mask = merged["open"].isna()
+    merged.loc[no_min_mask, "open"] = merged.loc[no_min_mask, "prev_close"]
+    # 若 open 仍为 NaN（首日），用 close 填充
+    merged["open"] = merged["open"].fillna(merged["close"])
+    merged = merged.drop(columns=["prev_close"])
+
+    # 确保 high/low 合理
+    merged["high"] = merged[["high", "open", "close"]].max(axis=1)
+    merged["low"] = merged[["low", "open", "close"]].min(axis=1)
+
+    return merged[["date", "open", "high", "low", "close", "volume"]].dropna()
+
 
 
 @cache_data(ttl=12 * 3600)
@@ -171,6 +292,60 @@ def get_gold_main_daily(start_date: str = "20180101",
 def get_cot_gold(years: int = 3) -> pd.DataFrame:
     """CFTC COT 黄金持仓，返回列: date, open_interest, mm_long, ..., mm_net"""
     return _ds.get_cot_gold(years)
+
+
+# ---------------------------------------------------------------------------
+# 离岸在岸息差系统
+# ---------------------------------------------------------------------------
+@cache_data(ttl=12 * 3600)
+def get_effr(start_date: str = "20200101") -> pd.DataFrame:
+    """有效联邦基金利率，返回列: date, effr（单位 %）"""
+    return _ds.get_effr(start_date)
+
+
+@cache_data(ttl=12 * 3600)
+def get_sofr_futures(start_date: str = "20200101") -> pd.DataFrame:
+    """3个月SOFR期货收盘价，返回列: date, sr3_close（隐含离岸利率 = 100 - sr3_close）"""
+    return _ds.get_sofr_futures(start_date)
+
+
+@cache_data(ttl=12 * 3600)
+def get_cnh_hibor() -> pd.DataFrame:
+    """离岸人民币3个月Hibor，返回列: date, cnh_hibor_3m（单位 %）"""
+    return _ds.get_cnh_hibor()
+
+
+@cache_data(ttl=12 * 3600)
+def get_usd_cny() -> pd.DataFrame:
+    """在岸人民币汇率，返回列: date, usd_cny"""
+    return _ds.get_usd_cny()
+
+
+@cache_data(ttl=12 * 3600)
+def get_usd_cnh() -> pd.DataFrame:
+    """离岸人民币汇率，返回列: date, usd_cnh"""
+    return _ds.get_usd_cnh()
+
+
+@cache_data(ttl=12 * 3600)
+def get_bond_yield_curve(start_date: str = "20100101") -> pd.DataFrame:
+    """中国国债收益率曲线(2Y+10Y)，返回列: date, bond_2y, bond_10y（单位 %）"""
+    return _ds.get_bond_yield_curve(start_date)
+
+
+@cache_data(ttl=12 * 3600)
+def get_us_macro_events(start_date: str = "20200101") -> pd.DataFrame:
+    """美国宏观事件日历（FOMC 利率决议 / CPI / PPI 公布日）。
+    返回列: event_date, event_type, event_name, value, prev_value, change,
+            surprise_hint, detail
+    """
+    return _ds.get_us_macro_events(start_date)
+
+
+@cache_data(ttl=12 * 3600)
+def get_us_treasury_yields(start_date: str = "20200101") -> pd.DataFrame:
+    """美国国债各期限收益率，返回长表: date, tenor, yield_pct（单位 %）。"""
+    return _ds.get_us_treasury_yields(start_date)
 
 
 def available_sources() -> list[str]:
