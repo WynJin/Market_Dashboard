@@ -23,6 +23,16 @@ def iter_recent_days(n_max: int = 45):
         d -= timedelta(days=1)
 
 
+def iter_days_from(start_date: date):
+    """从 start_date 到昨天（含），跳过周六周日。start_date 晚于昨天则返回空。"""
+    end = date.today() - timedelta(days=1)
+    d = start_date
+    while d <= end:
+        if d.weekday() < 5:
+            yield d
+        d += timedelta(days=1)
+
+
 # 新浪指数代码前缀：沪市 sh / 深市 sz
 SINA_PREFIX = {"SH": "sh", "SZ": "sz"}
 

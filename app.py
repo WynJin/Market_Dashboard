@@ -848,6 +848,175 @@ with tab_shibor:
             st.plotly_chart(fig_h, width="stretch")
         st.caption("数据源：shibor.org（全国银行间同业拆借中心）。短端利率飙升=资金面紧张，"
                    "视频中用于观察大资金流动性。")
+
+        # ===== Shibor3M 利率互换（IRS）收盘曲线 =====
+        st.markdown("---")
+        st.subheader("📈 Shibor3M 利率互换收盘曲线")
+        irs_lookback = st.slider("IRS 曲线回溯自然日数", 7, 365, _lb["irs"], step=7,
+                                 key="irs_lookback",
+                                 help="中国货币网仅提供近一年数据；回溯越长，历史曲线对比越多")
+        with st.spinner("拉取 Shibor3M 利率互换曲线…"):
+            irs = dfetch.get_shibor_irs_curve(lookback_days=irs_lookback)
+        show_data_sources([("Shibor3M 利率互换收盘曲线", "get_shibor_irs_curve",
+                            irs["date"].max() if not irs.empty else None)])
+
+        if not irs.empty:
+            irs_tenors = ["6M", "9M", "1Y", "2Y", "3Y", "4Y", "5Y", "7Y", "10Y"]
+            # 非线性 X 轴位置：短端 6M/9M/1Y 压缩，1Y 之后按年份间距排列
+            # 6M→9M→1Y 各 1 单位；1Y→2Y→3Y→4Y→5Y 各 2 单位(=1年)；5Y→7Y 4单位(=2年)；7Y→10Y 6单位(=3年)
+            _x_pos = {"6M": 0, "9M": 1, "1Y": 2, "2Y": 4, "3Y": 6,
+                      "4Y": 8, "5Y": 10, "7Y": 14, "10Y": 20}
+            latest_irs_date = irs["date"].max()
+            latest_irs = irs[irs["date"] == latest_irs_date].set_index("tenor")
+            # 确保期限顺序正确
+            latest_irs = latest_irs.reindex([t for t in irs_tenors if t in latest_irs.index])
+            x_vals = [_x_pos[t] for t in latest_irs.index]
+
+            # Y 轴范围收紧：取全量 bid/avg/ask 的 min/max，留少量 padding，让 bp 级价差可见
+            all_vals = pd.concat([latest_irs["bid"], latest_irs["avg"], latest_irs["ask"]]).dropna()
+            y_min, y_max = all_vals.min(), all_vals.max()
+            y_pad = max((y_max - y_min) * 0.15, 0.005)  # 至少 5bp padding
+
+            # ---- 主线图：报买 / 均值 / 报卖 ----
+            fig_irs = go.Figure()
+            fig_irs.add_trace(go.Scatter(
+                x=x_vals, y=latest_irs["bid"], mode="lines",
+                name="报买", line=dict(color=C_BLUE, width=1.2),
+                text=latest_irs.index, hovertemplate="%{text}<br>报买: %{y:.4f}%<extra></extra>"))
+            fig_irs.add_trace(go.Scatter(
+                x=x_vals, y=latest_irs["avg"], mode="lines",
+                name="均值", line=dict(color=C_GREEN, width=1.2),
+                text=latest_irs.index, hovertemplate="%{text}<br>均值: %{y:.4f}%<extra></extra>"))
+            fig_irs.add_trace(go.Scatter(
+                x=x_vals, y=latest_irs["ask"], mode="lines",
+                name="报卖", line=dict(color=C_RED, width=1.2),
+                text=latest_irs.index, hovertemplate="%{text}<br>报卖: %{y:.4f}%<extra></extra>"))
+            fig_irs.update_layout(
+                title=f"Shibor3M 利率互换收盘曲线（{latest_irs_date.strftime('%Y-%m-%d')}）",
+                height=440, margin=dict(l=10, r=10, t=50, b=10),
+                yaxis_title="利率 %", xaxis_title="标准期限",
+                yaxis=dict(
+                    range=[y_min - y_pad, y_max + y_pad],
+                    tickformat=".4f",
+                    showgrid=True, gridcolor="rgba(0,0,0,0.08)",
+                    zeroline=False,
+                ),
+                xaxis=dict(
+                    tickmode="array",
+                    tickvals=[_x_pos[t] for t in irs_tenors if t in _x_pos],
+                    ticktext=[t for t in irs_tenors if t in _x_pos],
+                    showgrid=True, gridcolor="rgba(0,0,0,0.05)",
+                ),
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+            )
+            st.plotly_chart(fig_irs, width="stretch")
+
+            # ---- 数据表格 ----
+            tbl = latest_irs[["bid", "avg", "ask"]].copy()
+            tbl.columns = ["报买(%)", "均值(%)", "报卖(%)"]
+            tbl = tbl.round(4)
+            st.dataframe(tbl, width="stretch")
+
+            # ---- 曲线形态自动判断 ----
+            avg_vals = latest_irs["avg"].dropna()
+            if len(avg_vals) >= 2:
+                short_end = avg_vals.iloc[0]   # 6M
+                long_end = avg_vals.iloc[-1]   # 10Y
+                spread = long_end - short_end
+                min_idx = avg_vals.idxmin()
+                min_val = avg_vals.min()
+                if spread < -0.05:
+                    shape_note = f"⚠️ **曲线倒挂**：10Y − 6M = {spread:+.2f} bp，长端利率低于短端，" \
+                                 f"反映市场预期未来降息 / 资金面短期紧张但长期宽松，通常是避险或衰退信号。"
+                elif spread < 0.05:
+                    shape_note = f"➖ **曲线平坦**：10Y − 6M = {spread:+.2f} bp，长短端利差极窄，" \
+                                 f"市场对未来利率方向分歧不大，处于变盘前夜。"
+                elif min_idx not in ("6M", "9M") and min_val < short_end:
+                    shape_note = f"🔻 **曲线中部凹陷**：最低点在 {min_idx}（{min_val:.4f}%），" \
+                                 f"10Y − 6M = {spread:+.2f} bp。中短期利率低于短端，反映市场预期中期降息、" \
+                                 f"之后利率回升（先下后上）。"
+                else:
+                    shape_note = f"📈 **正常正向曲线**：10Y − 6M = {spread:+.2f} bp，" \
+                                 f"长端高于短端，反映经济正常增长预期与期限溢价。"
+                st.info(shape_note)
+
+            # ---- 历史曲线对比 ----
+            all_dates = sorted(irs["date"].unique())
+            if len(all_dates) >= 2:
+                st.markdown("##### 历史曲线对比")
+                compare_n = st.slider("对比历史曲线条数", 1, min(10, len(all_dates)),
+                                      min(5, len(all_dates)), key="irs_compare_n")
+                # 取最近 N 个交易日
+                compare_dates = all_dates[-compare_n:]
+                fig_cmp = go.Figure()
+                cmp_palette = ["#c6dbef", "#9ecae1", "#6baed6", "#4292c6",
+                               "#2171b5", "#08519c", "#08306b", "#54278f",
+                               "#3f007d", "#253494"]
+                cmp_all_vals = []
+                for i, d in enumerate(compare_dates):
+                    day_data = irs[irs["date"] == d].set_index("tenor")
+                    day_data = day_data.reindex([t for t in irs_tenors if t in day_data.index])
+                    cmp_all_vals.append(day_data["avg"].dropna())
+                    is_latest = (d == compare_dates[-1])
+                    fig_cmp.add_trace(go.Scatter(
+                        x=[_x_pos[t] for t in day_data.index], y=day_data["avg"], mode="lines",
+                        name=pd.Timestamp(d).strftime("%m-%d"),
+                        line=dict(width=1.5 if is_latest else 1.0,
+                                  color=C_RED if is_latest else cmp_palette[i % len(cmp_palette)]),
+                    ))
+                # Y 轴范围收紧
+                cmp_flat = pd.concat(cmp_all_vals).dropna()
+                cmp_ymin, cmp_ymax = cmp_flat.min(), cmp_flat.max()
+                cmp_ypad = max((cmp_ymax - cmp_ymin) * 0.15, 0.005)
+                fig_cmp.update_layout(
+                    height=400, margin=dict(l=10, r=10, t=30, b=10),
+                    yaxis_title="均值利率 %", xaxis_title="标准期限",
+                    yaxis=dict(
+                        range=[cmp_ymin - cmp_ypad, cmp_ymax + cmp_ypad],
+                        tickformat=".4f",
+                        showgrid=True, gridcolor="rgba(0,0,0,0.08)",
+                        zeroline=False,
+                    ),
+                    xaxis=dict(
+                        tickmode="array",
+                        tickvals=[_x_pos[t] for t in irs_tenors if t in _x_pos],
+                        ticktext=[t for t in irs_tenors if t in _x_pos],
+                        showgrid=True, gridcolor="rgba(0,0,0,0.05)",
+                    ),
+                    hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                )
+                st.plotly_chart(fig_cmp, width="stretch")
+                st.caption("红色加粗线为最新交易日曲线，其余为历史曲线。曲线整体下移 → 降息预期升温；"
+                           "短端上移 > 长端 → 资金面收紧。")
+        else:
+            st.warning("未获取到 Shibor3M 利率互换曲线数据（可能是非交易时段或接口暂不可用）。")
+
+        st.markdown("""
+**📖 原理与看点说明**
+
+**什么是 Shibor3M 利率互换（IRS）曲线？**
+利率互换（Interest Rate Swap）是交易双方约定在未来一段时间内，以名义本金为基础，交换浮动利率与固定利率利息的合约。Shibor3M IRS 的浮动端挂钩 **3 个月 Shibor**，固定端就是图中的"均值"利率。这条曲线反映了市场对**未来 3M Shibor 走势的定价预期**——每个期限点的固定利率，本质是市场对该期限内浮动端利率的"平均预期"。
+
+**怎么看？—— 曲线形态 = 资金面 + 货币政策预期**
+
+| 曲线形态 | 含义 | 资金面信号 |
+|---|---|---|
+| 📈 正向陡峭（长端 >> 短端） | 正常形态，期限溢价充足 | 资金面宽松，经济增长预期良好 |
+| ➖ 平坦（长短端接近） | 市场对利率方向无共识 | 变盘前夜，关注方向选择 |
+| ⚠️ 倒挂（长端 < 短端） | 预期未来降息 / 短期资金极紧 | 避险情绪升温，可能是衰退或流动性危机信号 |
+| 🔻 中部凹陷 | 预期"先降息后回升" | 中期宽松、长期正常化 |
+
+**关键看点（结合本图）：**
+1. **短端（6M/9M/1Y）**：直接反映当前银行间资金面松紧。短端快速上行 = 跨季/跨月资金紧张，股市常承压。
+2. **长端（5Y/7Y/10Y）**：反映对中长期经济与通胀的预期。长端下行 = 经济衰退预期 / 降息周期。
+3. **10Y − 6M 利差**：期限利差。收窄甚至倒挂是重要预警信号——历史上倒挂后往往伴随货币政策转向或市场调整。
+4. **买卖价差（报卖 − 报买）**：做市商报价宽度，反映市场流动性。价差走阔 = 流动性下降，机构不愿成交。
+5. **与 SHIBOR 现货对比**：IRS 固定端 vs 同期限 SHIBOR 现货，利差反映对未来 Shibor 走势的溢价/折价。
+
+**实战用法：** 当短端 IRS 利率突然飙升、曲线陡峭化或倒挂时，配合 SHIBOR 现货短端利率上行，说明银行间资金面收紧，大机构在回笼资金，此时需警惕股市流动性收缩带来的调整压力。
+""")
     except Exception as e:
         st.error(f"SHIBOR 模块加载失败：{type(e).__name__}: {e}")
 
@@ -857,7 +1026,7 @@ with tab_shibor:
 with tab_pcr:
     try:
         # ---- 全市场 PCR（按标的 + 到期月聚合）----
-        pcr_cache_key = f"pcr_{pcr_lookback}"
+        pcr_cache_key = "pcr_accumulated"
         pcr = _fetch_with_progress(
             pcr_cache_key,
             "正在逐日回溯拉取全市场期权数据（首次较慢，请稍候）…",
@@ -875,7 +1044,7 @@ with tab_pcr:
         broker_df = pd.DataFrame()
         sel_brokers: list[str] = []
         if enable_broker:
-            broker_cache_key = f"opt_broker_{pcr_lookback}"
+            broker_cache_key = "opt_broker_accumulated"
             broker_df = _fetch_with_progress(
                 broker_cache_key,
                 "正在逐日回溯拉取期权券商持仓排名…",
@@ -1142,8 +1311,9 @@ with tab_pcr:
                         # 仅当只选一种 PCR 指标时叠加标准差上下轨
                         single_ind = show_vol ^ show_oi
                         active_col = "pcr_volume" if show_vol else "pcr_oi"
-                        palette = ["#1f5fbf", "#d6332a", "#1a9e5d", "#e08a1e",
-                                   "#7a3e9d", "#0f8b8d", "#b5651d", "#9aa5b1"]
+                        # PCR 配色避开红绿（与 K 线蜡烛色区分），使用蓝/紫/青/橙/棕/灰系
+                        palette = ["#1f5fbf", "#7b1fa2", "#00838f", "#ef6c00",
+                                   "#5d4037", "#455a64", "#6a1b9a", "#283593"]
 
                         for i, ul in enumerate(ordered_ul):
                             g = df[df["underlying"] == ul].sort_values("date").copy()
@@ -1155,65 +1325,72 @@ with tab_pcr:
                             sina_code = _COMMON_INDEX_CODES.get(auto_idx) if auto_idx else None
                             kl = (dfetch.get_index_kline(sina_code, lookback_days=pcr_lookback)
                                   if (sina_code and show_index) else pd.DataFrame())
+                            kl_x = kl["date"].dt.strftime("%Y-%m-%d") if not kl.empty else []
 
                             fig = go.Figure()
                             if single_ind:
                                 eff_w = min(band_window, len(g))
                                 g = ind.add_std_bands(g, active_col, window=eff_w,
                                                       n_sigma=band_sigma)
+                            g_x = g["date"].dt.strftime("%Y-%m-%d")
                             if show_vol:
                                 fig.add_trace(go.Scatter(
-                                    x=g["date"], y=g["pcr_volume"],
+                                    x=g_x, y=g["pcr_volume"],
                                     name=f"{ul} · 成交量 PCR",
                                     line=dict(color=color, width=3, dash="solid")))
                             if show_oi:
                                 fig.add_trace(go.Scatter(
-                                    x=g["date"], y=g["pcr_oi"],
+                                    x=g_x, y=g["pcr_oi"],
                                     name=f"{ul} · 持仓量 PCR",
                                     line=dict(color=color, width=3, dash="solid")))
                             if single_ind:
                                 fig.add_trace(go.Scatter(
-                                    x=g["date"], y=g["mean"], name="均值",
+                                    x=g_x, y=g["mean"], name="均值",
                                     line=dict(color="#b0b0b0", width=1.2, dash="dash"),
                                     opacity=0.8, showlegend=False))
                                 for lb, ub in [("lower1", "upper1")]:
                                     fig.add_trace(go.Scatter(
-                                        x=g["date"], y=g[ub], line=dict(
+                                        x=g_x, y=g[ub], line=dict(
                                             color=color, width=1, dash="dot"),
                                         opacity=0.3, showlegend=False, hoverinfo="skip"))
                                     fig.add_trace(go.Scatter(
-                                        x=g["date"], y=g[lb], line=dict(
+                                        x=g_x, y=g[lb], line=dict(
                                             color=color, width=1, dash="dot"),
                                         opacity=0.3, showlegend=False, hoverinfo="skip"))
                                 for lb, ub in [("lower2", "upper2")]:
                                     fig.add_trace(go.Scatter(
-                                        x=g["date"], y=g[ub], line=dict(
+                                        x=g_x, y=g[ub], line=dict(
                                             color=band2_color, width=1.5, dash="longdash"),
                                         opacity=0.85, showlegend=False, hoverinfo="skip"))
                                     fig.add_trace(go.Scatter(
-                                        x=g["date"], y=g[lb], line=dict(
+                                        x=g_x, y=g[lb], line=dict(
                                             color=band2_color, width=1.5, dash="longdash"),
                                         opacity=0.85, showlegend=False, hoverinfo="skip"))
                             fig.add_hline(y=1.0, line_dash="dash", line_color=C_GRAY,
                                           annotation_text="PCR=1", annotation_position="top right")
 
                             # 标的指数 K 线（副轴叠加，可选）
+                            # 填充半透明（弱化 K 线避免遮挡 PCR），描边深色实线始终清晰；
+                            # 悬停时 x 统一 tooltip 同时展示 PCR 值与 OHLC
                             if not kl.empty:
                                 fig.add_trace(go.Candlestick(
-                                    x=kl["date"], open=kl["open"], high=kl["high"],
+                                    x=kl_x, open=kl["open"], high=kl["high"],
                                     low=kl["low"], close=kl["close"],
                                     name=f"{auto_idx} K线", yaxis="y2",
-                                    increasing_line_color="#d6332a",
-                                    decreasing_line_color="#1a9e5d",
-                                    increasing_fillcolor="#d6332a",
-                                    decreasing_fillcolor="#1a9e5d",
+                                    increasing_line_color="#b71c1c",
+                                    decreasing_line_color="#1b5e20",
+                                    increasing_fillcolor="rgba(214, 51, 42, 0.55)",
+                                    decreasing_fillcolor="rgba(26, 158, 93, 0.55)",
+                                    increasing_line_width=1.2,
+                                    decreasing_line_width=1.2,
+                                    hoverlabel=dict(bgcolor="#222", font_color="#fff"),
                                 ))
                                 if show_kline_vol:
                                     vcolors = ["#d6332a" if c >= o else "#1a9e5d"
                                                for c, o in zip(kl["close"], kl["open"])]
                                     fig.add_trace(go.Bar(
-                                        x=kl["date"], y=kl["volume"], name="成交量",
-                                        marker_color=vcolors, opacity=0.25, yaxis="y3"))
+                                        x=kl_x, y=kl["volume"], name="成交量",
+                                        marker_color=vcolors, opacity=0.2, yaxis="y3"))
 
                             layout = dict(
                                 height=420, margin=dict(l=10, r=10, t=40, b=10),
@@ -1221,14 +1398,11 @@ with tab_pcr:
                                 hovermode="x unified",
                                 legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
                                 xaxis=dict(
+                                    type="category",          # 消除周末/节假日空档
                                     autorange=True,
                                     rangeslider=dict(visible=True, thickness=0.06),
-                                    rangeselector=dict(buttons=list([
-                                        dict(count=1, label="1月", step="month", stepmode="backward"),
-                                        dict(count=3, label="3月", step="month", stepmode="backward"),
-                                        dict(count=6, label="6月", step="month", stepmode="backward"),
-                                        dict(step="all", label="全部"),
-                                    ])),
+                                    tickangle=0,
+                                    tickfont=dict(size=10),
                                 ),
                                 yaxis=dict(title="PCR"),
                             )
@@ -1411,7 +1585,7 @@ with tab_gold:
 with tab_citic:
     try:
         citic = _fetch_with_progress(
-            f"citic_{futures_lookback}",
+            "citic_accumulated",
             "正在逐日回溯拉取中信期货持仓（首次较慢，请稍候）…",
             dfetch.get_citic_position_history, futures_lookback)
         show_data_sources([("中信期货多空持仓", "get_citic_position_history",

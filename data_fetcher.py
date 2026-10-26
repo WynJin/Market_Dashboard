@@ -9,6 +9,7 @@ Streamlit 的 @cache_data 缓存放在此层，保证切换数据源后可通过
 from __future__ import annotations
 
 import time
+from datetime import date, timedelta
 
 import pandas as pd
 
@@ -72,6 +73,71 @@ def is_cached(key: str) -> bool:
     if entry is None:
         return False
     return time.time() - entry[0] < _GLOBAL_TTL
+
+
+def _get_incremental(cache_key: str, fetch_fn, lookback_calendar_days: int,
+                     *fetch_args, _progress_callback=None, **fetch_kwargs) -> pd.DataFrame:
+    """增量拉取：缓存中保存已拉的全量数据，只补拉缺失的日期段。
+
+    - cache_key: 存储累计数据的 key（不随 lookback 变化）
+    - fetch_fn: 数据源方法，接受 (lookback_calendar_days=, start_date=, _progress_callback=)
+    - lookback_calendar_days: 用户请求的回溯自然日数
+    - *fetch_args, **fetch_kwargs: 透传给 fetch_fn 的额外参数（如 vars_list）
+
+    策略：
+      1. 目标区间 = [今天 - lookback, 昨天]
+      2. 已有缓存区间 = [cached_min, cached_max]
+      3. 若目标起点早于 cached_min → 往前补到目标起点
+      4. 若昨天晚于 cached_max → 往后补（新交易日）
+      5. 合并去重后返回目标区间内的数据
+    """
+    now = time.time()
+    for k in list(_GLOBAL_CACHE.keys()):
+        if now - _GLOBAL_CACHE[k][0] >= _GLOBAL_TTL:
+            del _GLOBAL_CACHE[k]
+
+    target_start = date.today() - timedelta(days=lookback_calendar_days)
+    yesterday = date.today() - timedelta(days=1)
+
+    entry = _GLOBAL_CACHE.get(cache_key)
+    cached = entry[1] if (entry and now - entry[0] < _GLOBAL_TTL) else pd.DataFrame()
+
+    # 计算需要拉取的起点
+    if cached.empty or "date" not in cached.columns:
+        fetch_start = target_start
+    else:
+        cached_dates = pd.to_datetime(cached["date"], errors="coerce").dt.normalize().dropna()
+        if cached_dates.empty:
+            fetch_start = target_start
+        else:
+            cached_min = cached_dates.min().date()
+            cached_max = cached_dates.max().date()
+            # 需要补的最早日期
+            fetch_start = min(target_start, cached_max + timedelta(days=1))
+            # 如果 fetch_start > yesterday，说明无需拉取
+            if fetch_start > yesterday:
+                result = cached[cached_dates >= pd.Timestamp(target_start)]
+                return result.sort_values("date").reset_index(drop=True)
+
+    new_data = fetch_fn(lookback_calendar_days=0, start_date=fetch_start,
+                        *fetch_args, _progress_callback=_progress_callback,
+                        **fetch_kwargs)
+
+    if new_data is not None and not new_data.empty:
+        if cached.empty:
+            merged = new_data
+        else:
+            merged = pd.concat([cached, new_data], ignore_index=True)
+            # 按所有列去重，避免重复日期的数据
+            merged = merged.drop_duplicates()
+        _GLOBAL_CACHE[cache_key] = (now, merged)
+        cached = merged
+
+    if cached.empty or "date" not in cached.columns:
+        return pd.DataFrame()
+    cached_dates = pd.to_datetime(cached["date"], errors="coerce").dt.normalize()
+    result = cached[cached_dates >= pd.Timestamp(target_start)]
+    return result.sort_values("date").reset_index(drop=True)
 
 
 def set_data_source(source: str) -> None:
@@ -231,16 +297,24 @@ def get_shibor() -> pd.DataFrame:
     return _ds.get_shibor()
 
 
+@cache_data(ttl=6 * 3600)
+def get_shibor_irs_curve(lookback_days: int = 30) -> pd.DataFrame:
+    """Shibor3M 利率互换收盘曲线，返回长格式: date, tenor, bid, avg, ask（单位 %）。
+
+    数据来自中国货币网 chinamoney.com.cn，仅提供近一年数据。
+    """
+    return _ds.get_shibor_irs_curve(lookback_days=lookback_days)
+
+
 def get_option_pcr_history(lookback_calendar_days: int = 45,
                            _progress_callback=None) -> pd.DataFrame:
     """期权 PCR 历史，返回列: date, underlying, call_volume, put_volume, ...
 
     _progress_callback(current, total) 用于 UI 显示加载进度；
-    进程级全局缓存（跨用户共享，TTL 12 小时），命中时不触发回调。
+    采用增量拉取：缓存已拉数据，仅补拉缺失日期（不随 lookback 全量重拉）。
     """
-    cache_key = f"pcr_{lookback_calendar_days}"
-    return _get_global(cache_key, _ds.get_option_pcr_history,
-                       lookback_calendar_days, _progress_callback=_progress_callback)
+    return _get_incremental("pcr_accumulated", _ds.get_option_pcr_history,
+                            lookback_calendar_days, _progress_callback=_progress_callback)
 
 
 def get_option_broker_holding_history(lookback_calendar_days: int = 45,
@@ -248,11 +322,10 @@ def get_option_broker_holding_history(lookback_calendar_days: int = 45,
     """期权券商持仓排名历史（上交所前 3 标的 × 认购/认沽前 5 会员）。
 
     返回列: date, underlying, broker, call_oi, put_oi, pcr_oi
-    进程级全局缓存（跨用户共享，TTL 12 小时）。
+    采用增量拉取：缓存已拉数据，仅补拉缺失日期。
     """
-    cache_key = f"opt_broker_{lookback_calendar_days}"
-    return _get_global(cache_key, _ds.get_option_broker_holding_history,
-                       lookback_calendar_days, _progress_callback=_progress_callback)
+    return _get_incremental("opt_broker_accumulated", _ds.get_option_broker_holding_history,
+                            lookback_calendar_days, _progress_callback=_progress_callback)
 
 
 @cache_data(ttl=12 * 3600)
@@ -267,12 +340,11 @@ def get_citic_position_history(lookback_calendar_days: int = 45,
     """中信期货多空持仓历史，返回列: date, variety, contract, long_oi, ...
 
     _progress_callback(current, total) 用于 UI 显示加载进度；
-    进程级全局缓存（跨用户共享，TTL 12 小时）。
+    采用增量拉取：缓存已拉数据，仅补拉缺失日期。
     """
-    cache_key = f"citic_{lookback_calendar_days}"
-    return _get_global(cache_key, _ds.get_citic_position_history,
-                       lookback_calendar_days, vars_list,
-                       _progress_callback=_progress_callback)
+    return _get_incremental("citic_accumulated", _ds.get_citic_position_history,
+                            lookback_calendar_days, vars_list,
+                            _progress_callback=_progress_callback)
 
 
 @cache_data(ttl=12 * 3600)

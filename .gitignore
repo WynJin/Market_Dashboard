@@ -9,6 +9,8 @@ __pycache__/
 venv/
 env/
 tests/
+data/
+prototype/
 
 # Streamlit
 .streamlit/secrets.toml

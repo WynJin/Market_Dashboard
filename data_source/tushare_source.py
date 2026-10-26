@@ -15,7 +15,7 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 
 from .protocol import DataSource
-from .utils import iter_recent_days, to_dt
+from .utils import iter_days_from, iter_recent_days, to_dt
 
 # 乐咕中文名 -> tushare ts_code
 PE_INDEX_TS = {
@@ -193,6 +193,12 @@ class TushareSource(DataSource):
         return df.sort_values("date").reset_index(drop=True)
 
     # ------------------------------------------------------------------
+    # 5b. Shibor3M 利率互换（IRS）收盘曲线
+    # ------------------------------------------------------------------
+    def get_shibor_irs_curve(self, lookback_days: int = 30) -> pd.DataFrame:
+        raise NotImplementedError("Tushare 无利率互换曲线接口，走中国货币网（akshare 适配器）")
+
+    # ------------------------------------------------------------------
     # 6. 期权 PCR：opt_basic 建立合约->(标的, C/P) 映射，opt_daily 逐日全量拉取后聚合
     #    积分门槛：opt_basic 需 5000 分，opt_daily 需 2000 分；不足则 factory 降级到 akshare
     # ------------------------------------------------------------------
@@ -215,7 +221,8 @@ class TushareSource(DataSource):
         return n
 
     def get_option_pcr_history(self, lookback_calendar_days: int = 45,
-                               _progress_callback=None) -> pd.DataFrame:
+                               _progress_callback=None,
+                               start_date: date | None = None) -> pd.DataFrame:
         # 1. 建立 ts_code -> (underlying, call_put, exp_month) 映射（SSE + SZSE）
         basic_frames = []
         for ex in ("SSE", "SZSE"):
@@ -238,7 +245,10 @@ class TushareSource(DataSource):
             ["underlying", "call_put", "exp_month"]].to_dict("index")
 
         # 2. 逐日拉 opt_daily（单日返回全市场全部合约），按 (标的, 到期月) 聚合 C/P
-        days = list(iter_recent_days(lookback_calendar_days))
+        if start_date is not None:
+            days = list(iter_days_from(start_date))
+        else:
+            days = list(iter_recent_days(lookback_calendar_days))
         total = len(days)
         frames = []
         for i, d in enumerate(days):

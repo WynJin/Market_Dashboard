@@ -25,6 +25,7 @@ akshare_source.py — AkShare 数据源适配器
 from __future__ import annotations
 
 import io
+import logging
 import zipfile
 from datetime import date, datetime
 from pathlib import Path
@@ -35,7 +36,9 @@ import requests
 import akshare as ak
 
 from .protocol import DataSource
-from .utils import iter_recent_days, to_dt
+from .utils import iter_days_from, iter_recent_days, to_dt
+
+logger = logging.getLogger(__name__)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -165,6 +168,145 @@ class AkShareSource(DataSource):
         return df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
     # ------------------------------------------------------------------
+    # 5b. Shibor3M 利率互换（IRS）收盘曲线（中国货币网 chinamoney.com.cn）
+    # ------------------------------------------------------------------
+    # Shibor3M 对应 cfgItemType=71，curveId=16
+    _IRS_TENORS = ["6M", "9M", "1Y", "2Y", "3Y", "4Y", "5Y", "7Y", "10Y"]
+    _IRS_CHINAMONEY_BASE = "https://www.chinamoney.com.cn/ags/ms/cm-u-bk-shibor"
+
+    def _get_chinamoney_session(self) -> requests.Session:
+        """获取中国货币网会话（首次访问需注册 IP，24h 内可直接访问）。"""
+        # __bond_register_service 是 akshare 模块级私有函数；用 getattr 避免类内名称修饰
+        import akshare.bond.bond_china_money as _bcm
+        register_fn = getattr(_bcm, "__bond_register_service", None)
+        if register_fn is None:
+            # 兼容旧版 akshare：直接创建会话并访问注册页
+            session = requests.Session()
+            session.get("https://www.chinamoney.com.cn/chinese/bkcurvclosedyhis/"
+                        "?bondType=CYCC000&reference=1",
+                        headers={"User-Agent": UA}, timeout=15)
+            return session
+        return register_fn()
+
+    def get_shibor_irs_curve(self, lookback_days: int = 30) -> pd.DataFrame:
+        """Shibor3M 利率互换收盘曲线，返回长格式: date, tenor, bid, avg, ask。"""
+        session = self._get_chinamoney_session()
+        headers = {
+            "User-Agent": UA,
+            "Referer": "https://www.chinamoney.com.cn/chinese/bkcurvfx/",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": "https://www.chinamoney.com.cn",
+        }
+        cfg_item = "71"  # Shibor3M
+        curve_id = "16"   # interestRateType
+
+        # ---- 1. 拉取当前日曲线（Ifcc 端点，含最新交易日）----
+        today_df = pd.DataFrame()
+        try:
+            r = session.post(
+                f"{self._IRS_CHINAMONEY_BASE}/Ifcc",
+                params={"lang": "CN", "cfgItemType": cfg_item},
+                headers=headers, timeout=15,
+            )
+            data = r.json()
+            recs = data.get("records", [])
+            show_date = data.get("data", {}).get("showDateCN")
+            if recs and show_date:
+                dt = pd.to_datetime(show_date)
+                rows = []
+                for rec in recs:
+                    tenor = rec.get("tl")
+                    if tenor not in self._IRS_TENORS:
+                        continue
+                    rows.append({
+                        "date": dt,
+                        "tenor": tenor,
+                        "bid": pd.to_numeric(rec.get("optimalBid"), errors="coerce"),
+                        "avg": pd.to_numeric(rec.get("optimalAvg"), errors="coerce"),
+                        "ask": pd.to_numeric(rec.get("optimalAsk"), errors="coerce"),
+                    })
+                today_df = pd.DataFrame(rows)
+        except Exception as e:
+            logger.warning(f"Shibor3M IRS 当前日数据拉取失败: {e}")
+
+        # ---- 2. 拉取历史曲线（IfccHis 端点，按月分段，每次最多 1 个月）----
+        hist_dfs = []
+        end = pd.Timestamp.now().normalize()
+        start = end - pd.Timedelta(days=lookback_days)
+        # 中国货币网只提供近一年数据
+        one_year_ago = end - pd.Timedelta(days=365)
+        if start < one_year_ago:
+            start = one_year_ago
+
+        cur = start
+        while cur <= end:
+            seg_end = min(cur + pd.Timedelta(days=28), end)
+            params_post = {
+                "interestRateType": curve_id,
+                "startDate": cur.strftime("%Y-%m-%d"),
+                "endDate": seg_end.strftime("%Y-%m-%d"),
+                "bidAskType": "",
+                "lang": "CN",
+                "quoteTime": "全部",
+                "pageSize": "5000",
+                "pageNum": "1",
+            }
+            try:
+                r = session.post(
+                    f"{self._IRS_CHINAMONEY_BASE}/IfccHis",
+                    params={"cfgItemType": cfg_item},
+                    data=params_post, headers=headers, timeout=20,
+                )
+                data = r.json()
+                recs = data.get("records", [])
+                for rec in recs:
+                    dt = pd.to_datetime(rec.get("date"))
+                    prices = rec.get("configPrice") or []
+                    if not prices or len(prices) < len(self._IRS_TENORS):
+                        continue
+                    ask_bid = rec.get("askBid", "")
+                    row = {"date": dt}
+                    for i, t in enumerate(self._IRS_TENORS):
+                        if i >= len(prices):
+                            break
+                        val = pd.to_numeric(prices[i], errors="coerce")
+                        if ask_bid == "报买":
+                            row[t] = {"bid": val}
+                        elif ask_bid == "报卖":
+                            row[t] = {"ask": val}
+                        elif ask_bid == "均值":
+                            row[t] = {"avg": val}
+                    # 将 {tenor: {bid/avg/ask: val}} 展开为长行
+                    for t in self._IRS_TENORS:
+                        if t in row and isinstance(row[t], dict):
+                            d_row = {"date": dt, "tenor": t}
+                            d_row.update(row[t])
+                            hist_dfs.append(d_row)
+            except Exception as e:
+                logger.warning(f"Shibor3M IRS 历史数据 {cur.date()}~{seg_end.date()} 拉取失败: {e}")
+            cur = seg_end + pd.Timedelta(days=1)
+
+        hist_df = pd.DataFrame(hist_dfs) if hist_dfs else pd.DataFrame()
+
+        # ---- 3. 合并当前日 + 历史，去重保留最新 ----
+        parts = []
+        if not hist_df.empty:
+            parts.append(hist_df)
+        if not today_df.empty:
+            parts.append(today_df)
+        if not parts:
+            return pd.DataFrame(columns=["date", "tenor", "bid", "avg", "ask"])
+
+        merged = pd.concat(parts, ignore_index=True)
+        # 同一天同一期限可能来自当前日和历史，保留最后一条（当前日优先）
+        merged = merged.drop_duplicates(subset=["date", "tenor"], keep="last")
+        for c in ["bid", "avg", "ask"]:
+            merged[c] = pd.to_numeric(merged[c], errors="coerce")
+        merged = merged.sort_values(["date", "tenor"]).reset_index(drop=True)
+        return merged
+
+
+    # ------------------------------------------------------------------
     # 6. 期权 PCR（上交所 + 深交所）
     # ------------------------------------------------------------------
     def _option_stats_one_day(self, d: date) -> pd.DataFrame | None:
@@ -200,8 +342,12 @@ class AkShareSource(DataSource):
         return agg
 
     def get_option_pcr_history(self, lookback_calendar_days: int = 45,
-                               _progress_callback=None) -> pd.DataFrame:
-        days = list(iter_recent_days(lookback_calendar_days))
+                               _progress_callback=None,
+                               start_date: date | None = None) -> pd.DataFrame:
+        if start_date is not None:
+            days = list(iter_days_from(start_date))
+        else:
+            days = list(iter_recent_days(lookback_calendar_days))
         total = len(days)
         frames = []
         for i, d in enumerate(days):
@@ -279,7 +425,8 @@ class AkShareSource(DataSource):
         return pivot[["underlying", "broker", "call_oi", "put_oi"]]
 
     def get_option_broker_holding_history(self, lookback_calendar_days: int = 45,
-                                          _progress_callback=None) -> pd.DataFrame:
+                                          _progress_callback=None,
+                                          start_date: date | None = None) -> pd.DataFrame:
         """上交所期权持仓排名（前 3 大标的 × 认购/认沽前 5 会员）。
 
         返回列: date, underlying, broker, call_oi, put_oi, pcr_oi
@@ -288,7 +435,10 @@ class AkShareSource(DataSource):
         url = ("https://www.sse.org.cn/api/report/ShowReport"
                "?SHOWTYPE=xlsx&CATALOGID=qqccpmtj1_online&TABKEY=tab1"
                "&txtSearchDate={date}&jy=qqcc_online")
-        days = list(iter_recent_days(lookback_calendar_days))
+        if start_date is not None:
+            days = list(iter_days_from(start_date))
+        else:
+            days = list(iter_recent_days(lookback_calendar_days))
         total = len(days)
         frames = []
         for i, d in enumerate(days):
@@ -404,8 +554,12 @@ class AkShareSource(DataSource):
         return pd.DataFrame(rows)
 
     def get_citic_position_history(self, lookback_calendar_days: int = 45,
-                                   vars_list=None, _progress_callback=None) -> pd.DataFrame:
-        days = list(iter_recent_days(lookback_calendar_days))
+                                   vars_list=None, _progress_callback=None,
+                                   start_date: date | None = None) -> pd.DataFrame:
+        if start_date is not None:
+            days = list(iter_days_from(start_date))
+        else:
+            days = list(iter_recent_days(lookback_calendar_days))
         total = len(days)
         frames = []
         for i, d in enumerate(days):

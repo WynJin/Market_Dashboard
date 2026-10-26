@@ -52,6 +52,7 @@ METHOD_ROUTING: dict[str, list[str]] = {
     "get_index_pe_daily_csindex":    ["tushare", "akshare"],
     "get_index_daily":               ["tushare", "akshare"],
     "get_shibor":                    ["akshare", "tushare"],   # akshare 一次拿全历史更快
+    "get_shibor_irs_curve":          ["akshare"],              # 中国货币网 chinamoney.com.cn，tushare 无此接口
     "get_option_pcr_history":        ["tushare", "akshare"],  # tushare opt_daily 单日全量，调用少一半
     "get_option_broker_holding_history": ["akshare"],          # 仅上交所公开持仓排名，tushare 无此接口
     "get_index_futures_basis_history": ["tushare", "akshare"],
@@ -195,5 +196,6 @@ def get_lookback_defaults() -> dict:
         _LB_DEFAULTS = {
             "pcr": int(cfg.get("pcr_lookback_days", 30)),
             "futures": int(cfg.get("futures_lookback_days", 120)),
+            "irs": int(cfg.get("irs_lookback_days", 90)),
         }
     return _LB_DEFAULTS
