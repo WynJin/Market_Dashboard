@@ -646,9 +646,16 @@ class AkShareSource(DataSource):
     def get_cot_gold(self, years: int = 3) -> pd.DataFrame:
         this_year = date.today().year
         frames = []
+        last_err = None
         for yr in range(this_year, this_year - years, -1):
             url = f"https://www.cftc.gov/files/dea/history/fut_disagg_txt_{yr}.zip"
-            resp = requests.get(url, headers=HEADERS, timeout=120)
+            try:
+                # 注意：cftc.gov 对浏览器 UA 会返回 403，必须用默认 UA；
+                # 超时设为 (连接10s, 读取60s)，避免网络卡住时长时间阻塞
+                resp = requests.get(url, timeout=(10, 60))
+            except requests.RequestException as e:
+                last_err = e
+                break  # 网络不通时后续年份大概率同样失败，直接放弃
             if resp.status_code != 200:
                 continue
             with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
@@ -657,8 +664,8 @@ class AkShareSource(DataSource):
                     text = f.read().decode("utf-8", errors="ignore")
             frames.append(self._parse_cot_zip_text(text))
         if not frames:
-            return pd.DataFrame(columns=["date", "open_interest", "mm_long",
-                                         "mm_short", "mm_spread", "mm_net"])
+            raise RuntimeError(
+                f"cftc.gov 直连失败（国内网络通常无法访问，需代理）：{last_err or '无有效响应'}")
         out = pd.concat(frames, ignore_index=True)
         return out.dropna(subset=["date"]).drop_duplicates("date").sort_values(
             "date").reset_index(drop=True)

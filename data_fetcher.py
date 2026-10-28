@@ -67,22 +67,41 @@ def clear_global_cache(prefix: str | None = None) -> None:
                 del _GLOBAL_CACHE[k]
 
 
-def is_cached(key: str) -> bool:
-    """检查全局缓存中是否存在未过期的 key（供 app 层预知是否需要显示进度条）。"""
+def is_cached(key: str, lookback_calendar_days: int | None = None) -> bool:
+    """检查全局缓存是否已覆盖目标回溯区间（供 app 层判断是否需要显示进度条）。
+
+    仅判断 key 是否存在是不够的：增量缓存会一直存在，但每次调整回溯天数
+    仍需补拉缺失区间，此时必须显示进度条。因此传入 lookback 时还要校验：
+      - 缓存最早日期 <= 目标起始日期（往前已覆盖）
+      - 缓存最晚日期 >= 今天-3天（往后基本跟到最新，容忍周末/短假）
+    """
     entry = _GLOBAL_CACHE.get(key)
-    if entry is None:
+    if entry is None or time.time() - entry[0] >= _GLOBAL_TTL:
         return False
-    return time.time() - entry[0] < _GLOBAL_TTL
+    if lookback_calendar_days is None:
+        return True
+
+    df = entry[1]
+    if df is None or df.empty or "date" not in df.columns:
+        return False
+    dates = pd.to_datetime(df["date"], errors="coerce").dt.normalize().dropna()
+    if dates.empty:
+        return False
+
+    target_start = date.today() - timedelta(days=lookback_calendar_days)
+    fresh_before = date.today() - timedelta(days=3)
+    return dates.min().date() <= target_start and dates.max().date() >= fresh_before
 
 
 def _get_incremental(cache_key: str, fetch_fn, lookback_calendar_days: int,
-                     *fetch_args, _progress_callback=None, **fetch_kwargs) -> pd.DataFrame:
+                     _progress_callback=None, **fetch_kwargs) -> pd.DataFrame:
     """增量拉取：缓存中保存已拉的全量数据，只补拉缺失的日期段。
 
     - cache_key: 存储累计数据的 key（不随 lookback 变化）
     - fetch_fn: 数据源方法，接受 (lookback_calendar_days=, start_date=, _progress_callback=)
     - lookback_calendar_days: 用户请求的回溯自然日数
-    - *fetch_args, **fetch_kwargs: 透传给 fetch_fn 的额外参数（如 vars_list）
+    - **fetch_kwargs: 透传给 fetch_fn 的额外关键字参数（如 vars_list）；
+      注意必须用关键字传递——这些方法第一个位置参数就是 lookback_calendar_days
 
     策略：
       1. 目标区间 = [今天 - lookback, 昨天]
@@ -120,8 +139,7 @@ def _get_incremental(cache_key: str, fetch_fn, lookback_calendar_days: int,
                 return result.sort_values("date").reset_index(drop=True)
 
     new_data = fetch_fn(lookback_calendar_days=0, start_date=fetch_start,
-                        *fetch_args, _progress_callback=_progress_callback,
-                        **fetch_kwargs)
+                        _progress_callback=_progress_callback, **fetch_kwargs)
 
     if new_data is not None and not new_data.empty:
         if cached.empty:
@@ -343,7 +361,7 @@ def get_citic_position_history(lookback_calendar_days: int = 45,
     采用增量拉取：缓存已拉数据，仅补拉缺失日期。
     """
     return _get_incremental("citic_accumulated", _ds.get_citic_position_history,
-                            lookback_calendar_days, vars_list,
+                            lookback_calendar_days, vars_list=vars_list,
                             _progress_callback=_progress_callback)
 
 
@@ -360,10 +378,33 @@ def get_gold_main_daily(start_date: str = "20180101",
     return _ds.get_gold_main_daily(start_date, end_date)
 
 
+_COT_CACHE_DIR = _Path(__file__).resolve().parent / "data" / "cot_cache"
+_COT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
 @cache_data(ttl=24 * 3600)
 def get_cot_gold(years: int = 3) -> pd.DataFrame:
-    """CFTC COT 黄金持仓，返回列: date, open_interest, mm_long, ..., mm_net"""
-    return _ds.get_cot_gold(years)
+    """CFTC COT 黄金持仓，返回列: date, open_interest, mm_long, ..., mm_net
+
+    cftc.gov 国内网络经常超时，因此做本地磁盘缓存兜底：
+    拉取成功时写入缓存；拉取失败时回退到上次成功的缓存，避免模块整体报错。
+    """
+    cache_file = _COT_CACHE_DIR / "gold.parquet"
+    try:
+        df = _ds.get_cot_gold(years)
+    except Exception:
+        if cache_file.exists():
+            return pd.read_parquet(cache_file)
+        raise
+    if df is not None and not df.empty:
+        try:
+            df.to_parquet(cache_file, index=False)
+        except Exception:
+            pass
+        return df
+    if cache_file.exists():
+        return pd.read_parquet(cache_file)
+    return df
 
 
 # ---------------------------------------------------------------------------

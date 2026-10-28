@@ -115,13 +115,14 @@ def add_index_overlay(fig, selected, date_min, date_max):
 
 
 def _fetch_with_progress(cache_key: str, label: str, fetch_fn, *args, **kwargs):
-    """复用的逐日回溯加载器：全局缓存（跨用户共享）+ Streamlit 进度条。
+    """复用的逐日回溯加载器：全局增量缓存（跨用户共享）+ Streamlit 进度条。
 
-    - 命中全局缓存 → 静默返回，不显示进度条
-    - 未命中 → 显示进度条，回调实时更新
+    - 缓存已覆盖目标回溯区间 → 静默返回，不显示进度条
+    - 需要补拉任意缺失区间 → 显示进度条，回调实时更新
     fetch_fn 必须支持 _progress_callback(current, total) 关键字参数。
     """
-    if dfetch.is_cached(cache_key):
+    lookback = args[0] if args else kwargs.get("lookback_calendar_days")
+    if dfetch.is_cached(cache_key, lookback):
         return fetch_fn(*args, **kwargs)
     prog = st.progress(0.0, text=label)
 
@@ -1325,45 +1326,43 @@ with tab_pcr:
                             sina_code = _COMMON_INDEX_CODES.get(auto_idx) if auto_idx else None
                             kl = (dfetch.get_index_kline(sina_code, lookback_days=pcr_lookback)
                                   if (sina_code and show_index) else pd.DataFrame())
-                            kl_x = kl["date"].dt.strftime("%Y-%m-%d") if not kl.empty else []
 
                             fig = go.Figure()
                             if single_ind:
                                 eff_w = min(band_window, len(g))
                                 g = ind.add_std_bands(g, active_col, window=eff_w,
                                                       n_sigma=band_sigma)
-                            g_x = g["date"].dt.strftime("%Y-%m-%d")
                             if show_vol:
                                 fig.add_trace(go.Scatter(
-                                    x=g_x, y=g["pcr_volume"],
+                                    x=g["date"], y=g["pcr_volume"],
                                     name=f"{ul} · 成交量 PCR",
                                     line=dict(color=color, width=3, dash="solid")))
                             if show_oi:
                                 fig.add_trace(go.Scatter(
-                                    x=g_x, y=g["pcr_oi"],
+                                    x=g["date"], y=g["pcr_oi"],
                                     name=f"{ul} · 持仓量 PCR",
                                     line=dict(color=color, width=3, dash="solid")))
                             if single_ind:
                                 fig.add_trace(go.Scatter(
-                                    x=g_x, y=g["mean"], name="均值",
+                                    x=g["date"], y=g["mean"], name="均值",
                                     line=dict(color="#b0b0b0", width=1.2, dash="dash"),
                                     opacity=0.8, showlegend=False))
                                 for lb, ub in [("lower1", "upper1")]:
                                     fig.add_trace(go.Scatter(
-                                        x=g_x, y=g[ub], line=dict(
+                                        x=g["date"], y=g[ub], line=dict(
                                             color=color, width=1, dash="dot"),
                                         opacity=0.3, showlegend=False, hoverinfo="skip"))
                                     fig.add_trace(go.Scatter(
-                                        x=g_x, y=g[lb], line=dict(
+                                        x=g["date"], y=g[lb], line=dict(
                                             color=color, width=1, dash="dot"),
                                         opacity=0.3, showlegend=False, hoverinfo="skip"))
                                 for lb, ub in [("lower2", "upper2")]:
                                     fig.add_trace(go.Scatter(
-                                        x=g_x, y=g[ub], line=dict(
+                                        x=g["date"], y=g[ub], line=dict(
                                             color=band2_color, width=1.5, dash="longdash"),
                                         opacity=0.85, showlegend=False, hoverinfo="skip"))
                                     fig.add_trace(go.Scatter(
-                                        x=g_x, y=g[lb], line=dict(
+                                        x=g["date"], y=g[lb], line=dict(
                                             color=band2_color, width=1.5, dash="longdash"),
                                         opacity=0.85, showlegend=False, hoverinfo="skip"))
                             fig.add_hline(y=1.0, line_dash="dash", line_color=C_GRAY,
@@ -1374,7 +1373,7 @@ with tab_pcr:
                             # 悬停时 x 统一 tooltip 同时展示 PCR 值与 OHLC
                             if not kl.empty:
                                 fig.add_trace(go.Candlestick(
-                                    x=kl_x, open=kl["open"], high=kl["high"],
+                                    x=kl["date"], open=kl["open"], high=kl["high"],
                                     low=kl["low"], close=kl["close"],
                                     name=f"{auto_idx} K线", yaxis="y2",
                                     increasing_line_color="#b71c1c",
@@ -1389,21 +1388,41 @@ with tab_pcr:
                                     vcolors = ["#d6332a" if c >= o else "#1a9e5d"
                                                for c, o in zip(kl["close"], kl["open"])]
                                     fig.add_trace(go.Bar(
-                                        x=kl_x, y=kl["volume"], name="成交量",
+                                        x=kl["date"], y=kl["volume"], name="成交量",
                                         marker_color=vcolors, opacity=0.2, yaxis="y3"))
+
+                            # 去掉非交易日（周末/节假日，如国庆）造成的空白间隔：
+                            # 统计时间区间内实际缺失的日期，用 rangebreaks 隐藏
+                            present = set()
+                            for s in [g["date"], kl["date"] if not kl.empty else pd.Series(dtype="datetime64[ns]")]:
+                                present.update(pd.to_datetime(s, errors="coerce")
+                                               .dropna().dt.normalize().tolist())
+                            if present:
+                                full = pd.date_range(min(present), max(present), freq="D")
+                                missing = [d.strftime("%Y-%m-%d") for d in full
+                                           if d not in present]
+                            else:
+                                missing = []
+
+                            xaxis_cfg = dict(
+                                autorange=True,
+                                rangeslider=dict(visible=True, thickness=0.06),
+                                rangeselector=dict(buttons=list([
+                                    dict(count=1, label="1月", step="month", stepmode="backward"),
+                                    dict(count=3, label="3月", step="month", stepmode="backward"),
+                                    dict(count=6, label="6月", step="month", stepmode="backward"),
+                                    dict(step="all", label="全部"),
+                                ])),
+                            )
+                            if missing:
+                                xaxis_cfg["rangebreaks"] = [dict(values=missing)]
 
                             layout = dict(
                                 height=420, margin=dict(l=10, r=10, t=40, b=10),
                                 title=f"{ul} PCR",
                                 hovermode="x unified",
                                 legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-                                xaxis=dict(
-                                    type="category",          # 消除周末/节假日空档
-                                    autorange=True,
-                                    rangeslider=dict(visible=True, thickness=0.06),
-                                    tickangle=0,
-                                    tickfont=dict(size=10),
-                                ),
+                                xaxis=xaxis_cfg,
                                 yaxis=dict(title="PCR"),
                             )
                             if not kl.empty:
